@@ -1,0 +1,120 @@
+{
+  "name": "@popcomputer/files",
+  "version": "0.1.0",
+  "description": "Effect-native filesystem primitives for Cloudflare D1 and R2",
+  "type": "module",
+  "packageManager": "bun@1.3.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./adapter": {
+      "types": "./dist/adapter.d.ts",
+      "import": "./dist/adapter.js"
+    },
+    "./http": {
+      "types": "./dist/http.d.ts",
+      "import": "./dist/http.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    },
+    "./reclaimer": {
+      "types": "./dist/reclaimer.d.ts",
+      "import": "./dist/reclaimer.js"
+    },
+    "./d1": {
+      "types": "./dist/integrations/d1.d.ts",
+      "import": "./dist/integrations/d1.js"
+    },
+    "./d1/schema": {
+      "types": "./dist/integrations/d1-schema.d.ts",
+      "import": "./dist/integrations/d1-schema.js"
+    },
+    "./cloudflare": {
+      "types": "./dist/integrations/cloudflare.d.ts",
+      "import": "./dist/integrations/cloudflare.js"
+    },
+    "./in-memory": {
+      "types": "./dist/in-memory.d.ts",
+      "import": "./dist/in-memory.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    },
+    "./migrations/d1/0001_files.sql": "./migrations/d1/0001_files.sql"
+  },
+  "files": [
+    "dist",
+    "docs",
+    "migrations/d1",
+    "CHANGELOG.md",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "node --input-type=module --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
+    "build": "bun run clean && tsc",
+    "check": "tsc --noEmit && tsc -p tsconfig.tests.json && tsc -p tsconfig.cloudflare-tests.json",
+    "lint": "oxlint src tests package-tests scripts vitest.config.ts vitest.cloudflare.config.ts oxlint.config.ts",
+    "test": "vitest run",
+    "test:cloudflare": "vitest run --config vitest.cloudflare.config.ts",
+    "test:node": "bun run build && node tests/node-esm-smoke.mjs",
+    "test:package": "bun run build && tsc -p tsconfig.package-tests.json && node scripts/verify-package.mjs",
+    "verify": "bun run lint && bun run check && bun run test && bun run test:cloudflare && bun run test:package",
+    "prepack": "bun run build",
+    "prepublishOnly": "bun run verify"
+  },
+  "keywords": [
+    "effect",
+    "filesystem",
+    "cloudflare",
+    "d1",
+    "r2",
+    "popcomputer"
+  ],
+  "author": "Patrick Ogilvie",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PatrickOgilvie/popcomputer-files.git"
+  },
+  "homepage": "https://github.com/PatrickOgilvie/popcomputer-files#readme",
+  "bugs": {
+    "url": "https://github.com/PatrickOgilvie/popcomputer-files/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "drizzle-orm": "^0.45.2",
+    "effect": "^4.0.0-rc.109"
+  },
+  "peerDependenciesMeta": {
+    "drizzle-orm": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.0.0",
+    "@cloudflare/workers-types": "^5.20260820.1",
+    "@effect/vitest": "4.0.0-rc.109",
+    "@types/node": "^24.3.0",
+    "drizzle-orm": "0.45.2",
+    "effect": "4.0.0-rc.109",
+    "oxlint": "1.78.0",
+    "typescript": "^5.9.3",
+    "vitest": "4.1.0"
+  }
+}
