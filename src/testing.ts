@@ -8,9 +8,11 @@ import type {
 } from "./adapter.js"
 import type {
   ByteCount,
+  FileContentType,
   FileId,
   FileName,
   FileSystemId,
+  Sha256,
 } from "./file.js"
 
 /** Object metadata installed at the byte-storage seam by a behavior test. */
@@ -25,6 +27,8 @@ export type TestIssuedFileCapability =
       readonly _tag: "Upload"
       readonly locator: FileObjectLocator
       readonly maximumBytes: ByteCount
+      readonly sha256: Sha256 | null
+      readonly contentType: FileContentType | null
       readonly capability: IssuedFileCapability
     }
   | {

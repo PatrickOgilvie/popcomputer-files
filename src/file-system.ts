@@ -7,6 +7,7 @@ import {
   toPublicFileNode,
   type FileActivityAction,
   type StoredFileNode,
+  type StoredPendingFileNode,
   type StoredReadyFileNode,
 } from "./adapter.js"
 import {
@@ -24,27 +25,34 @@ import {
   IdempotencyConflict,
   InvalidFileInput,
   InvalidStoredFile,
+  StaleFileNode,
   UploadAlreadyConfirmed,
+  UploadChecksumMismatch,
   UploadNoLongerAvailable,
   UploadNotFound,
 } from "./errors.js"
 import {
   ByteCountSchema,
   TimestampMillisSchema,
+  sha256Of,
   type ByteCount,
   type DownloadTicket,
   type FileActor,
+  type FileChangePage,
+  type FileChangeSequence,
+  type FileContentType,
   type FileId,
   type FileListTarget,
   type FileName,
+  type FileNode,
   type FilePage,
   type FileSystemId,
   type FolderNode,
   type IdempotencyKey,
   type PageCursor,
   type PageSize,
-  type PendingFileNode,
   type ReadyFileNode,
+  type Sha256,
   type TimestampMillis,
   type UploadTicket,
 } from "./file.js"
@@ -72,6 +80,11 @@ export interface ListChildrenInput extends FileOperationContext {
   }
 }
 
+/** Read one live node. */
+export interface GetNodeInput extends FileOperationContext {
+  readonly fileId: FileId
+}
+
 /** Create one folder at the root or beneath an existing folder. */
 export interface CreateFolderInput extends FileOperationContext {
   readonly parentId: FileId | null
@@ -85,6 +98,10 @@ export interface RequestUploadInput extends FileOperationContext {
   readonly name: FileName
   readonly size: ByteCount
   readonly idempotencyKey: IdempotencyKey
+  /** When set, the store rejects other bytes and confirmation requires this digest. */
+  readonly sha256?: Sha256 | null
+  /** When set, stored as the object's media type whatever the upload sends. */
+  readonly contentType?: FileContentType | null
 }
 
 /** Confirm that bytes exist for a pending upload. */
@@ -92,20 +109,51 @@ export interface ConfirmUploadInput extends FileOperationContext {
   readonly fileId: FileId
 }
 
+/** Store bytes the host already holds as one ready file. */
+export interface WriteFileInput extends FileOperationContext {
+  readonly parentId: FileId | null
+  readonly name: FileName
+  readonly idempotencyKey: IdempotencyKey
+  readonly body: Uint8Array<ArrayBuffer>
+  readonly contentType: FileContentType | null
+}
+
 /** Issue a direct-download capability for one ready file. */
 export interface RequestDownloadInput extends FileOperationContext {
   readonly fileId: FileId
 }
 
-/** Rename one pending or ready file leaf. */
-export interface RenameFileInput extends FileOperationContext {
+/** Stream one ready file's bytes to the host. */
+export interface ReadFileInput extends FileOperationContext {
   readonly fileId: FileId
+}
+
+/** One ready file and a stream of its bytes. */
+export interface ReadFileResult {
+  readonly file: ReadyFileNode
+  readonly body: ReadableStream<Uint8Array>
+}
+
+/** Move a file or folder into another folder, rename it, or both. */
+export interface MoveInput extends FileOperationContext {
+  readonly fileId: FileId
+  readonly parentId: FileId | null
   readonly name: FileName
+  /** When set, the move applies only while the node was last changed at this instant. */
+  readonly expectedUpdatedAt?: TimestampMillis | null
 }
 
 /** Soft-delete one file or folder subtree. */
 export interface SoftDeleteInput extends FileOperationContext {
   readonly fileId: FileId
+  /** When set, the delete applies only while the node was last changed at this instant. */
+  readonly expectedUpdatedAt?: TimestampMillis | null
+}
+
+/** Read committed changes after a known position. */
+export interface ListChangesInput extends FileOperationContext {
+  readonly after: FileChangeSequence | null
+  readonly limit: PageSize
 }
 
 /** Failures callers can handle while listing children. */
@@ -113,6 +161,12 @@ export type ListChildrenError =
   | FileNotFound
   | FolderRequired
   | InvalidFileInput
+  | FileCatalogUnavailable
+  | InvalidStoredFile
+
+/** Failures callers can handle while reading one node. */
+export type GetNodeError =
+  | FileNotFound
   | FileCatalogUnavailable
   | InvalidStoredFile
 
@@ -145,6 +199,7 @@ export type RequestUploadError =
 export type ConfirmUploadError =
   | FileNotFound
   | UploadNotFound
+  | UploadChecksumMismatch
   | FileTooLarge
   | FileQuotaExceeded
   | FileQuotaPolicyUnavailable
@@ -152,19 +207,47 @@ export type ConfirmUploadError =
   | InvalidStoredFile
   | FileObjectStoreUnavailable
 
+/** Failures callers can handle while writing a file from the host. */
+export type WriteFileError =
+  | FileNotFound
+  | FolderRequired
+  | FileNameConflict
+  | IdempotencyConflict
+  | UploadNoLongerAvailable
+  | UploadNotFound
+  | UploadChecksumMismatch
+  | FileTooLarge
+  | FileQuotaExceeded
+  | FileQuotaPolicyUnavailable
+  | InvalidFileInput
+  | FileCatalogUnavailable
+  | InvalidStoredFile
+  | FileObjectStoreUnavailable
+
 /** Failures callers can handle while requesting a download. */
 export type RequestDownloadError =
   | FileNotFound
+  | FileRequired
   | UploadNotFound
   | FileCatalogUnavailable
   | InvalidStoredFile
   | FileCapabilityUnavailable
 
-/** Failures callers can handle while renaming a file. */
-export type RenameFileError =
+/** Failures callers can handle while reading a file's bytes. */
+export type ReadFileError =
   | FileNotFound
   | FileRequired
+  | UploadNotFound
+  | FileCatalogUnavailable
+  | InvalidStoredFile
+  | FileObjectStoreUnavailable
+
+/** Failures callers can handle while moving a node. */
+export type MoveError =
+  | FileNotFound
+  | FolderRequired
   | FileNameConflict
+  | StaleFileNode
   | InvalidFileInput
   | FileCatalogUnavailable
   | InvalidStoredFile
@@ -172,14 +255,21 @@ export type RenameFileError =
 /** Failures callers can handle while deleting a subtree. */
 export type SoftDeleteError =
   | FileNotFound
+  | StaleFileNode
   | FileCatalogUnavailable
   | InvalidStoredFile
+
+/** Failures callers can handle while reading the change log. */
+export type ListChangesError = FileCatalogUnavailable | InvalidStoredFile
 
 /** Cohesive filesystem use cases over catalog and byte-object seams. */
 export interface FileSystemService {
   readonly listChildren: (
     input: ListChildrenInput,
   ) => Effect.Effect<FilePage, ListChildrenError>
+  readonly getNode: (
+    input: GetNodeInput,
+  ) => Effect.Effect<FileNode, GetNodeError>
   readonly createFolder: (
     input: CreateFolderInput,
   ) => Effect.Effect<FolderNode, CreateFolderError>
@@ -189,15 +279,23 @@ export interface FileSystemService {
   readonly confirmUpload: (
     input: ConfirmUploadInput,
   ) => Effect.Effect<ReadyFileNode, ConfirmUploadError>
+  /** Reserve, store and confirm in one idempotent command; a replay returns the file. */
+  readonly writeFile: (
+    input: WriteFileInput,
+  ) => Effect.Effect<ReadyFileNode, WriteFileError>
   readonly requestDownload: (
     input: RequestDownloadInput,
   ) => Effect.Effect<DownloadTicket, RequestDownloadError>
-  readonly renameFile: (
-    input: RenameFileInput,
-  ) => Effect.Effect<PendingFileNode | ReadyFileNode, RenameFileError>
+  readonly readFile: (
+    input: ReadFileInput,
+  ) => Effect.Effect<ReadFileResult, ReadFileError>
+  readonly move: (input: MoveInput) => Effect.Effect<FileNode, MoveError>
   readonly softDelete: (
     input: SoftDeleteInput,
   ) => Effect.Effect<void, SoftDeleteError>
+  readonly listChanges: (
+    input: ListChangesInput,
+  ) => Effect.Effect<FileChangePage, ListChangesError>
 }
 
 /** Effect service tag for the filesystem use cases. */
@@ -215,20 +313,8 @@ const futureTimestamp = (
   durationMillis: number,
 ): TimestampMillis => TimestampMillisSchema.make(now + durationMillis)
 
-const asReadyNode = (node: StoredReadyFileNode): ReadyFileNode => {
-  return {
-    _tag: "ReadyFile",
-    id: node.id,
-    parentId: node.parentId,
-    name: node.name,
-    path: node.path,
-    createdAt: node.createdAt,
-    updatedAt: node.updatedAt,
-    size: node.size,
-    contentType: node.contentType,
-    digest: node.digest,
-  }
-}
+const asReadyNode = (node: StoredReadyFileNode): ReadyFileNode =>
+  toPublicFileNode(node)
 
 const makeService = Effect.gen(function* () {
   const catalog = yield* FileCatalog
@@ -271,6 +357,23 @@ const makeService = Effect.gen(function* () {
       Effect.catch(() => Effect.void),
     )
 
+  const liveReadyFile = Effect.fn("FileSystem.liveReadyFile")(function* (
+    fileSystemId: FileSystemId,
+    fileId: FileId,
+  ) {
+    const node = yield* catalog.get(fileSystemId, fileId)
+    if (node === null) {
+      return yield* Effect.fail(new FileNotFound({ fileId }))
+    }
+    if (node._tag === "Folder") {
+      return yield* Effect.fail(new FileRequired({ fileId }))
+    }
+    if (node._tag === "PendingFile") {
+      return yield* Effect.fail(new UploadNotFound({ fileId }))
+    }
+    return node
+  })
+
   const listChildren = Effect.fn("FileSystem.listChildren")(function* (
     input: ListChildrenInput,
   ) {
@@ -296,6 +399,16 @@ const makeService = Effect.gen(function* () {
           new InvalidFileInput({ reason: "invalid_cursor" }),
         )
     }
+  })
+
+  const getNode = Effect.fn("FileSystem.getNode")(function* (
+    input: GetNodeInput,
+  ) {
+    const node = yield* catalog.get(input.fileSystemId, input.fileId)
+    if (node === null) {
+      return yield* Effect.fail(new FileNotFound({ fileId: input.fileId }))
+    }
+    return toPublicFileNode(node)
   })
 
   const createFolder = Effect.fn("FileSystem.createFolder")(function* (
@@ -344,55 +457,50 @@ const makeService = Effect.gen(function* () {
     }
   })
 
-  const requestUpload = Effect.fn("FileSystem.requestUpload")(function* (
-    input: RequestUploadInput,
-  ) {
-    if (input.size > settings.maximumUploadBytes) {
-      return yield* Effect.fail(new FileTooLarge())
-    }
+  type ReservationOutcome =
+    | { readonly _tag: "Pending"; readonly node: StoredPendingFileNode }
+    | { readonly _tag: "Ready"; readonly node: StoredReadyFileNode }
 
-    const at = yield* nowMillis
+  const reserve = Effect.fn("FileSystem.reserve")(function* (
+    input: FileOperationContext & {
+      readonly parentId: FileId | null
+      readonly name: FileName
+      readonly idempotencyKey: IdempotencyKey
+      readonly size: ByteCount
+      readonly sha256: Sha256 | null
+    },
+    at: TimestampMillis,
+  ) {
     const id = yield* ids.nextFileId
-    const uploadExpiresAt = futureTimestamp(
-      at,
-      objects.uploadCapabilityTtlMillis,
-    )
-    const pendingExpiresAt = futureTimestamp(
-      at,
-      objects.reclamationGraceMillis,
-    )
-    const locator = objects.locationFor(input.fileSystemId, id)
     const result = yield* catalog.reserveUpload({
       id,
       parentId: input.parentId,
       name: input.name,
       idempotencyKey: input.idempotencyKey,
-      locator,
+      locator: objects.locationFor(input.fileSystemId, id),
       maximumBytes: input.size,
-      pendingExpiresAt,
+      pendingExpiresAt: futureTimestamp(at, objects.reclamationGraceMillis),
+      expectedSha256: input.sha256,
       fileSystemId: input.fileSystemId,
       actor: input.actor,
       now: at,
     })
-
     switch (result._tag) {
       case "Created":
       case "ReplayPending": {
-        const capability = yield* objects.issueUpload({
-          locator: result.node.locator,
-          maximumBytes: result.node.maximumBytes,
-          expiresAt: uploadExpiresAt,
-        })
-        return {
-          fileId: result.node.id,
-          url: capability.url,
-          expiresAt: capability.expiresAt,
+        const outcome: ReservationOutcome = {
+          _tag: "Pending",
+          node: result.node,
         }
+        return outcome
       }
-      case "ReplayReady":
-        return yield* Effect.fail(
-          new UploadAlreadyConfirmed({ fileId: result.node.id }),
-        )
+      case "ReplayReady": {
+        const outcome: ReservationOutcome = {
+          _tag: "Ready",
+          node: result.node,
+        }
+        return outcome
+      }
       case "ReplayUnavailable":
         return yield* Effect.fail(
           new UploadNoLongerAvailable({ fileId: result.fileId }),
@@ -414,6 +522,91 @@ const makeService = Effect.gen(function* () {
     }
   })
 
+  const requestUpload = Effect.fn("FileSystem.requestUpload")(function* (
+    input: RequestUploadInput,
+  ) {
+    if (input.size > settings.maximumUploadBytes) {
+      return yield* Effect.fail(new FileTooLarge())
+    }
+
+    const at = yield* nowMillis
+    const reservation = yield* reserve(
+      { ...input, sha256: input.sha256 ?? null },
+      at,
+    )
+    if (reservation._tag === "Ready") {
+      return yield* Effect.fail(
+        new UploadAlreadyConfirmed({ fileId: reservation.node.id }),
+      )
+    }
+    const capability = yield* objects.issueUpload({
+      locator: reservation.node.locator,
+      maximumBytes: reservation.node.maximumBytes,
+      expiresAt: futureTimestamp(at, objects.uploadCapabilityTtlMillis),
+      sha256: reservation.node.expectedSha256,
+      contentType: input.contentType ?? null,
+    })
+    return {
+      fileId: reservation.node.id,
+      url: capability.url,
+      expiresAt: capability.expiresAt,
+    }
+  })
+
+  const confirmPending = Effect.fn("FileSystem.confirmPending")(function* (
+    context: FileOperationContext,
+    current: StoredPendingFileNode,
+  ) {
+    const metadata = yield* objects.stat(current.locator)
+    if (metadata === null) {
+      return yield* Effect.fail(new UploadNotFound({ fileId: current.id }))
+    }
+    if (
+      metadata.size > current.maximumBytes ||
+      metadata.size > settings.maximumUploadBytes
+    ) {
+      return yield* Effect.fail(new FileTooLarge())
+    }
+    if (
+      current.expectedSha256 !== null &&
+      (metadata.digest?._tag !== "Sha256" ||
+        metadata.digest.value !== current.expectedSha256)
+    ) {
+      return yield* Effect.fail(
+        new UploadChecksumMismatch({ fileId: current.id }),
+      )
+    }
+
+    const at = yield* nowMillis
+    const quotaBytes = yield* quotaPolicy.quotaBytesFor(context.fileSystemId)
+    const result = yield* catalog.confirmUpload({
+      fileId: current.id,
+      size: metadata.size,
+      contentType: metadata.contentType,
+      digest: metadata.digest,
+      quotaBytes,
+      fileSystemId: context.fileSystemId,
+      actor: context.actor,
+      now: at,
+    })
+    switch (result._tag) {
+      case "Confirmed":
+        yield* recordActivityBestEffort(
+          "confirm_upload",
+          context,
+          current.id,
+          at,
+        )
+        return asReadyNode(result.node)
+      case "AlreadyReady":
+        return asReadyNode(result.node)
+      case "NotFound":
+        return yield* Effect.fail(new FileNotFound({ fileId: current.id }))
+      case "QuotaExceeded":
+        return yield* Effect.fail(new FileQuotaExceeded())
+    }
+  })
+
   const confirmUpload = Effect.fn("FileSystem.confirmUpload")(function* (
     input: ConfirmUploadInput,
   ) {
@@ -424,61 +617,43 @@ const makeService = Effect.gen(function* () {
     if (current._tag === "ReadyFile") {
       return asReadyNode(current)
     }
+    return yield* confirmPending(input, current)
+  })
 
-    const metadata = yield* objects.stat(current.locator)
-    if (metadata === null) {
-      return yield* Effect.fail(new UploadNotFound({ fileId: input.fileId }))
-    }
-    if (
-      metadata.size > current.maximumBytes ||
-      metadata.size > settings.maximumUploadBytes
-    ) {
+  const writeFile = Effect.fn("FileSystem.writeFile")(function* (
+    input: WriteFileInput,
+  ) {
+    if (input.body.byteLength > settings.maximumUploadBytes) {
       return yield* Effect.fail(new FileTooLarge())
     }
-
+    const sha256 = yield* sha256Of(input.body)
     const at = yield* nowMillis
-    const quotaBytes = yield* quotaPolicy.quotaBytesFor(
-      input.fileSystemId,
+    const reservation = yield* reserve(
+      {
+        ...input,
+        size: ByteCountSchema.make(input.body.byteLength),
+        sha256,
+      },
+      at,
     )
-    const result = yield* catalog.confirmUpload({
-      fileId: input.fileId,
-      size: metadata.size,
-      contentType: metadata.contentType,
-      digest: metadata.digest,
-      quotaBytes,
-      fileSystemId: input.fileSystemId,
-      actor: input.actor,
-      now: at,
-    })
-    switch (result._tag) {
-      case "Confirmed":
-        yield* recordActivityBestEffort(
-          "confirm_upload",
-          input,
-          input.fileId,
-          at,
-        )
-        return asReadyNode(result.node)
-      case "AlreadyReady":
-        return asReadyNode(result.node)
-      case "NotFound":
-        return yield* Effect.fail(new FileNotFound({ fileId: input.fileId }))
-      case "QuotaExceeded":
-        return yield* Effect.fail(new FileQuotaExceeded())
+    if (reservation._tag === "Ready") {
+      return asReadyNode(reservation.node)
     }
+    yield* objects.put({
+      locator: reservation.node.locator,
+      body: input.body,
+      contentType: input.contentType,
+      sha256,
+    })
+    const ready = yield* confirmPending(input, reservation.node)
+    yield* recordActivityBestEffort("write_file", input, ready.id, at)
+    return ready
   })
 
   const requestDownload = Effect.fn("FileSystem.requestDownload")(function* (
     input: RequestDownloadInput,
   ) {
-    const node = yield* catalog.get(input.fileSystemId, input.fileId)
-    if (node === null || node._tag === "Folder") {
-      return yield* Effect.fail(new FileNotFound({ fileId: input.fileId }))
-    }
-    if (node._tag === "PendingFile") {
-      return yield* Effect.fail(new UploadNotFound({ fileId: input.fileId }))
-    }
-
+    const node = yield* liveReadyFile(input.fileSystemId, input.fileId)
     const capability = yield* objects.issueDownload({
       locator: node.locator,
       fileName: node.name,
@@ -499,36 +674,61 @@ const makeService = Effect.gen(function* () {
       at,
     )
     return {
-      file: asReadyNode(node),
+      file: asReadyNode(stillLive),
       url: capability.url,
       expiresAt: capability.expiresAt,
     }
   })
 
-  const renameFile = Effect.fn("FileSystem.renameFile")(function* (
-    input: RenameFileInput,
+  const readFile = Effect.fn("FileSystem.readFile")(function* (
+    input: ReadFileInput,
   ) {
+    const node = yield* liveReadyFile(input.fileSystemId, input.fileId)
+    const body = yield* objects.get(node.locator)
+    if (body === null) {
+      return yield* Effect.fail(
+        new FileObjectStoreUnavailable({
+          operation: "get",
+          cause: new Error("A ready file has no stored object."),
+        }),
+      )
+    }
     const at = yield* nowMillis
-    const result = yield* catalog.renameFile({
+    yield* recordActivityBestEffort("read_file", input, input.fileId, at)
+    return { file: asReadyNode(node), body }
+  })
+
+  const move = Effect.fn("FileSystem.move")(function* (input: MoveInput) {
+    const at = yield* nowMillis
+    const result = yield* catalog.move({
       fileId: input.fileId,
+      parentId: input.parentId,
       name: input.name,
+      expectedUpdatedAt: input.expectedUpdatedAt ?? null,
       fileSystemId: input.fileSystemId,
       actor: input.actor,
       now: at,
     })
     switch (result._tag) {
-      case "Renamed":
-        yield* recordActivityBestEffort(
-          "rename_file",
-          input,
-          input.fileId,
-          at,
-        )
+      case "Moved":
+        yield* recordActivityBestEffort("move_node", input, input.fileId, at)
+        return toPublicFileNode(result.node)
+      case "Unchanged":
         return toPublicFileNode(result.node)
       case "NotFound":
         return yield* Effect.fail(new FileNotFound({ fileId: input.fileId }))
-      case "FolderNotSupported":
-        return yield* Effect.fail(new FileRequired({ fileId: input.fileId }))
+      case "Stale":
+        return yield* Effect.fail(new StaleFileNode({ fileId: input.fileId }))
+      case "ParentNotFound":
+        return yield* Effect.fail(new FileNotFound({ fileId: input.parentId }))
+      case "ParentNotFolder":
+        return yield* Effect.fail(
+          new FolderRequired({ fileId: result.parentId }),
+        )
+      case "Cycle":
+        return yield* Effect.fail(
+          new InvalidFileInput({ reason: "move_into_itself" }),
+        )
       case "NameConflict":
         return yield* Effect.fail(new FileNameConflict())
       case "InvalidPath":
@@ -552,21 +752,41 @@ const makeService = Effect.gen(function* () {
       actor: input.actor,
       now: at,
       reclaimAfter,
+      expectedUpdatedAt: input.expectedUpdatedAt ?? null,
     })
-    if (result._tag === "NotFound") {
-      return yield* Effect.fail(new FileNotFound({ fileId: input.fileId }))
+    switch (result._tag) {
+      case "Deleted":
+        yield* recordActivityBestEffort("soft_delete", input, input.fileId, at)
+        return
+      case "NotFound":
+        return yield* Effect.fail(new FileNotFound({ fileId: input.fileId }))
+      case "Stale":
+        return yield* Effect.fail(new StaleFileNode({ fileId: input.fileId }))
     }
-    yield* recordActivityBestEffort("soft_delete", input, input.fileId, at)
+  })
+
+  const listChanges = Effect.fn("FileSystem.listChanges")(function* (
+    input: ListChangesInput,
+  ) {
+    return yield* catalog.listChanges(
+      input.fileSystemId,
+      input.after,
+      input.limit,
+    )
   })
 
   return FileSystem.of({
     listChildren,
+    getNode,
     createFolder,
     requestUpload,
     confirmUpload,
+    writeFile,
     requestDownload,
-    renameFile,
+    readFile,
+    move,
     softDelete,
+    listChanges,
   })
 })
 
@@ -624,4 +844,5 @@ export const byteCount = (value: number): ByteCount =>
   ByteCountSchema.make(value)
 
 /** Project a catalog record through the public file-node contract. */
-export const projectNode = (node: StoredFileNode) => toPublicFileNode(node)
+export const projectNode = (node: StoredFileNode): FileNode =>
+  toPublicFileNode(node)

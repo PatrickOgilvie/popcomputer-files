@@ -407,10 +407,11 @@ describe("in-memory FileSystem", () => {
       }
 
       const first = yield* files.requestUpload(request)
-      yield* files.renameFile({
+      yield* files.move({
         fileSystemId: fileSystemA,
         actor,
         fileId: first.fileId,
+        parentId: null,
         name: name("renamed.txt"),
       })
 
@@ -576,30 +577,22 @@ describe("in-memory FileSystem", () => {
         idempotencyKey: key("second-upload"),
       })
 
-      const folderRename = yield* Effect.flip(
-        files.renameFile({
-          fileSystemId: fileSystemA,
-          actor,
-          fileId: parent.id,
-          name: name("renamed-parent"),
-        }),
-      )
-      expect(folderRename._tag).toBe("FileRequired")
-
       const conflict = yield* Effect.flip(
-        files.renameFile({
+        files.move({
           fileSystemId: fileSystemA,
           actor,
           fileId: first.fileId,
+          parentId: child.id,
           name: name("second.txt"),
         }),
       )
       expect(conflict._tag).toBe("FileNameConflict")
 
-      const renamed = yield* files.renameFile({
+      const renamed = yield* files.move({
         fileSystemId: fileSystemA,
         actor,
         fileId: first.fileId,
+        parentId: child.id,
         name: name("renamed.txt"),
       })
       expect(renamed.path).toBe("parent/child/renamed.txt")

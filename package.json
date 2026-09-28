@@ -1,6 +1,6 @@
 {
   "name": "@popcomputer/files",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Effect-native filesystem primitives for Cloudflare D1 and R2",
   "type": "module",
   "packageManager": "bun@1.3.1",
@@ -52,7 +52,8 @@
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js"
     },
-    "./migrations/d1/0001_files.sql": "./migrations/d1/0001_files.sql"
+    "./migrations/d1/0001_files.sql": "./migrations/d1/0001_files.sql",
+    "./migrations/d1/0002_file_digests_and_changes.sql": "./migrations/d1/0002_file_digests_and_changes.sql"
   },
   "files": [
     "dist",
@@ -99,7 +100,7 @@
   },
   "peerDependencies": {
     "drizzle-orm": "^0.45.2",
-    "effect": "^4.0.0-rc.109"
+    "effect": "^4.0.0-rc.116"
   },
   "peerDependenciesMeta": {
     "drizzle-orm": {
@@ -109,10 +110,10 @@
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.0.0",
     "@cloudflare/workers-types": "^5.20260820.1",
-    "@effect/vitest": "4.0.0-rc.109",
+    "@effect/vitest": "4.0.0-rc.116",
     "@types/node": "^24.3.0",
     "drizzle-orm": "0.45.2",
-    "effect": "4.0.0-rc.109",
+    "effect": "4.0.0-rc.116",
     "oxlint": "1.78.0",
     "typescript": "^5.9.3",
     "vitest": "4.1.0"

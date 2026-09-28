@@ -15,8 +15,11 @@ import type {
   MaintenanceBatchSize,
   PageCursor,
   PageSize,
+  FileChangePage,
+  FileChangeSequence,
   PendingFileNode,
   ReadyFileNode,
+  Sha256,
   TimestampMillis,
 } from "./file.js"
 import {
@@ -26,6 +29,7 @@ import {
   FileIdSchema,
   FileNameSchema,
   RelativePathSchema,
+  Sha256Schema,
   TimestampMillisSchema,
 } from "./file.js"
 import type {
@@ -63,6 +67,8 @@ export const StoredFileNodeSchema = Schema.TaggedUnion({
     locator: FileObjectLocatorSchema,
     maximumBytes: ByteCountSchema,
     pendingExpiresAt: TimestampMillisSchema,
+    /** The digest the uploader declared, which confirmation must observe. */
+    expectedSha256: Schema.NullOr(Sha256Schema),
   },
   ReadyFile: {
     ...storedNodeBase,
@@ -130,6 +136,8 @@ export interface CatalogReserveUploadInput extends CatalogMutationContext {
   readonly locator: FileObjectLocator
   readonly maximumBytes: ByteCount
   readonly pendingExpiresAt: TimestampMillis
+  /** Part of the command fingerprint: a replay must declare the same digest. */
+  readonly expectedSha256: Sha256 | null
 }
 
 /** Atomic pending-to-ready command supplied to a catalog. */
@@ -141,16 +149,21 @@ export interface CatalogConfirmUploadInput extends CatalogMutationContext {
   readonly quotaBytes: ByteCount
 }
 
-/** Atomic file rename command supplied to a catalog. */
-export interface CatalogRenameFileInput extends CatalogMutationContext {
+/** Atomic move-and-rename command for one node and its subtree. */
+export interface CatalogMoveInput extends CatalogMutationContext {
   readonly fileId: FileId
+  readonly parentId: FileId | null
   readonly name: FileName
+  /** When set, the move applies only while the node was last changed at this instant. */
+  readonly expectedUpdatedAt: TimestampMillis | null
 }
 
 /** Atomic subtree soft-delete command supplied to a catalog. */
 export interface CatalogSoftDeleteInput extends CatalogMutationContext {
   readonly fileId: FileId
   readonly reclaimAfter: TimestampMillis
+  /** When set, the delete applies only while the node was last changed at this instant. */
+  readonly expectedUpdatedAt: TimestampMillis | null
 }
 
 /** Semantic outcomes of atomic folder creation. */
@@ -183,14 +196,15 @@ export type CatalogConfirmUploadResult =
   | { readonly _tag: "NotFound" }
   | { readonly _tag: "QuotaExceeded" }
 
-/** Semantic outcomes of atomic rename. */
-export type CatalogRenameFileResult =
-  | {
-      readonly _tag: "Renamed"
-      readonly node: StoredPendingFileNode | StoredReadyFileNode
-    }
+/** Semantic outcomes of an atomic move. */
+export type CatalogMoveResult =
+  | { readonly _tag: "Moved"; readonly node: StoredFileNode }
+  | { readonly _tag: "Unchanged"; readonly node: StoredFileNode }
   | { readonly _tag: "NotFound" }
-  | { readonly _tag: "FolderNotSupported" }
+  | { readonly _tag: "Stale"; readonly node: StoredFileNode }
+  | { readonly _tag: "ParentNotFound" }
+  | { readonly _tag: "ParentNotFolder"; readonly parentId: FileId }
+  | { readonly _tag: "Cycle" }
   | { readonly _tag: "NameConflict" }
   | { readonly _tag: "InvalidPath" }
 
@@ -198,6 +212,7 @@ export type CatalogRenameFileResult =
 export type CatalogSoftDeleteResult =
   | { readonly _tag: "Deleted" }
   | { readonly _tag: "NotFound" }
+  | { readonly _tag: "Stale"; readonly node: StoredFileNode }
 
 /** Metadata catalog seam; adapters own isolation, uniqueness, and transition races. */
 export interface FileCatalogService {
@@ -234,16 +249,25 @@ export interface FileCatalogService {
     CatalogConfirmUploadResult,
     FileCatalogUnavailable | InvalidStoredFile
   >
-  readonly renameFile: (
-    input: CatalogRenameFileInput,
+  readonly move: (
+    input: CatalogMoveInput,
   ) => Effect.Effect<
-    CatalogRenameFileResult,
+    CatalogMoveResult,
     FileCatalogUnavailable | InvalidStoredFile
   >
   readonly softDelete: (
     input: CatalogSoftDeleteInput,
   ) => Effect.Effect<
     CatalogSoftDeleteResult,
+    FileCatalogUnavailable | InvalidStoredFile
+  >
+  /** Changes committed after `after` (or from the start), oldest first. */
+  readonly listChanges: (
+    fileSystemId: FileSystemId,
+    after: FileChangeSequence | null,
+    limit: PageSize,
+  ) => Effect.Effect<
+    FileChangePage,
     FileCatalogUnavailable | InvalidStoredFile
   >
 }
@@ -284,11 +308,32 @@ export interface FileObjectsService {
     readonly locator: FileObjectLocator
     readonly maximumBytes: ByteCount
     readonly expiresAt: TimestampMillis
+    /** When set, the store must reject bytes with any other digest. */
+    readonly sha256: Sha256 | null
+    /** When set, the store records this media type whatever the upload sends. */
+    readonly contentType: FileContentType | null
   }) => Effect.Effect<IssuedFileCapability, FileCapabilityUnavailable>
   readonly issueDownload: (input: {
     readonly locator: FileObjectLocator
     readonly fileName: FileName
   }) => Effect.Effect<IssuedFileCapability, FileCapabilityUnavailable>
+  /**
+   * Store bytes the host already holds at a fresh locator. The write is
+   * create-only: an object already stored there is left as it is.
+   */
+  readonly put: (input: {
+    readonly locator: FileObjectLocator
+    readonly body: Uint8Array<ArrayBuffer>
+    readonly contentType: FileContentType | null
+    readonly sha256: Sha256
+  }) => Effect.Effect<void, FileObjectStoreUnavailable>
+  /** Stream one object's bytes; null when no object is stored there. */
+  readonly get: (
+    locator: FileObjectLocator,
+  ) => Effect.Effect<
+    ReadableStream<Uint8Array> | null,
+    FileObjectStoreUnavailable
+  >
   /** Idempotently remove one byte object; absence is success. */
   readonly delete: (
     locator: FileObjectLocator,
@@ -300,6 +345,14 @@ export interface FileReclamationCandidate {
   readonly fileSystemId: FileSystemId
   readonly fileId: FileId
   readonly locator: FileObjectLocator
+}
+
+/** Earliest instants at which each kind of maintenance becomes possible. */
+export interface FileMaintenanceDue {
+  readonly pendingExpiresAt: TimestampMillis | null
+  readonly reclaimAfter: TimestampMillis | null
+  readonly reclaimedDeletedAt: TimestampMillis | null
+  readonly oldestChangeAt: TimestampMillis | null
 }
 
 /** Catalog operations reserved for bounded maintenance workers. */
@@ -335,6 +388,23 @@ export interface FileReclamationCatalogService {
     number,
     FileCatalogUnavailable | InvalidStoredFile
   >
+  /**
+   * The earliest instants maintenance could act on: a live pending upload's
+   * expiry, an unreclaimed tombstone's reclaim time, a reclaimed tombstone's
+   * deletion, and the oldest change-log entry. Null where nothing is waiting.
+   */
+  readonly maintenanceDue: () => Effect.Effect<
+    FileMaintenanceDue,
+    FileCatalogUnavailable | InvalidStoredFile
+  >
+  /** Remove change-log entries recorded before an instant, oldest first. */
+  readonly purgeChangesBatch: (input: {
+    readonly recordedBefore: TimestampMillis
+    readonly limit: MaintenanceBatchSize
+  }) => Effect.Effect<
+    number,
+    FileCatalogUnavailable | InvalidStoredFile
+  >
 }
 
 /** Effect service tag for operational reclamation catalog access. */
@@ -354,8 +424,10 @@ export type FileActivityAction =
   | "confirm_upload"
   | "create_folder"
   | "issue_download"
-  | "rename_file"
+  | "move_node"
+  | "read_file"
   | "soft_delete"
+  | "write_file"
 
 /** Best-effort operational activity event. */
 export interface FileActivity {

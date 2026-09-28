@@ -10,13 +10,15 @@ import type {
   FileId,
   FileListTarget,
   FileName,
+  FileNode,
   FilePage,
   FolderNode,
   IdempotencyKey,
   PageCursor,
   PageSize,
-  PendingFileNode,
   ReadyFileNode,
+  Sha256,
+  TimestampMillis,
   UploadTicket,
 } from "./file.js"
 import { FileContentTypeSchema } from "./file.js"
@@ -75,12 +77,18 @@ export interface ClientRequestUploadInput {
   readonly name: FileName
   readonly size: ByteCount
   readonly idempotencyKey: IdempotencyKey
+  /** When set, the store rejects bytes with any other SHA-256. */
+  readonly sha256?: Sha256 | null
 }
 
-/** File rename input accepted by the typed client. */
-export interface ClientRenameFileInput {
+/** Move-or-rename input accepted by the typed client. */
+export interface ClientMoveNodeInput {
   readonly fileId: FileId
   readonly name: FileName
+  /** Destination folder; omit to rename in place. */
+  readonly parentId?: FileId | null
+  /** Apply only while the node was last changed at this instant. */
+  readonly expectedUpdatedAt?: TimestampMillis
 }
 
 interface CreateFolderRequestBody {
@@ -90,15 +98,19 @@ interface CreateFolderRequestBody {
 
 interface RequestUploadRequestBody extends CreateFolderRequestBody {
   readonly size: ByteCount
+  readonly sha256: Sha256 | null
+  readonly contentType: FileContentType | null
 }
 
-interface RenameFileRequestBody {
+interface MoveNodeRequestBody {
   readonly name: FileName
+  readonly parentId?: FileId | null
+  readonly expectedUpdatedAt?: string
 }
 
 type FilesClientRequestBody =
   | CreateFolderRequestBody
-  | RenameFileRequestBody
+  | MoveNodeRequestBody
   | RequestUploadRequestBody
 
 /** Full direct-upload workflow input with a caller-owned replayable body factory. */
@@ -131,11 +143,12 @@ export interface FilesClientService {
   readonly requestDownload: (
     fileId: FileId,
   ) => Effect.Effect<DownloadTicket, FilesClientError>
-  readonly renameFile: (
-    input: ClientRenameFileInput,
-  ) => Effect.Effect<PendingFileNode | ReadyFileNode, FilesClientError>
+  readonly moveNode: (
+    input: ClientMoveNodeInput,
+  ) => Effect.Effect<FileNode, FilesClientError>
   readonly softDelete: (
     fileId: FileId,
+    condition?: { readonly expectedUpdatedAt?: TimestampMillis },
   ) => Effect.Effect<void, FilesClientError>
   readonly putFile: (
     input: PutFileInput,
@@ -495,7 +508,9 @@ export const makeFilesClient = (
   })
 
   const requestUpload = Effect.fn("FilesClient.requestUpload")(function* (
-    input: ClientRequestUploadInput,
+    input: ClientRequestUploadInput & {
+      readonly contentType?: FileContentType | null
+    },
   ) {
     const dto = yield* requestJson(
       "FilesClient.requestUpload",
@@ -506,6 +521,8 @@ export const makeFilesClient = (
           parentId: input.parentId,
           name: input.name,
           size: input.size,
+          sha256: input.sha256 ?? null,
+          contentType: input.contentType ?? null,
         },
         { "idempotency-key": input.idempotencyKey },
       ),
@@ -549,36 +566,42 @@ export const makeFilesClient = (
     return downloadTicketFromDto(dto)
   })
 
-  const renameFile = Effect.fn("FilesClient.renameFile")(function* (
-    input: ClientRenameFileInput,
+  const moveNode = Effect.fn("FilesClient.moveNode")(function* (
+    input: ClientMoveNodeInput,
   ) {
+    const body: MoveNodeRequestBody = {
+      name: input.name,
+      ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
+      ...(input.expectedUpdatedAt === undefined
+        ? {}
+        : {
+            expectedUpdatedAt: new Date(input.expectedUpdatedAt).toISOString(),
+          }),
+    }
     const dto = yield* requestJson(
-      "FilesClient.renameFile",
+      "FilesClient.moveNode",
       endpoint(encodeURIComponent(input.fileId)),
-      authenticatedJson("PATCH", { name: input.name }),
+      authenticatedJson("PATCH", body),
       FileNodeResponseDtoSchema,
     )
-    const node = fileNodeFromDto(dto.node)
-    if (node._tag === "Folder") {
-      return yield* Effect.fail(
-        clientError(
-          "FilesClient.renameFile",
-          "invalid_response",
-          200,
-          "rename_response_was_folder",
-        ),
-      )
-    }
-    return node
+    return fileNodeFromDto(dto.node)
   })
 
   const softDelete = Effect.fn("FilesClient.softDelete")(function* (
     fileId: FileId,
+    condition?: { readonly expectedUpdatedAt?: TimestampMillis },
   ) {
     const operation = "FilesClient.softDelete"
+    const target = endpoint(encodeURIComponent(fileId))
+    if (condition?.expectedUpdatedAt !== undefined) {
+      target.searchParams.set(
+        "expectedUpdatedAt",
+        new Date(condition.expectedUpdatedAt).toISOString(),
+      )
+    }
     const response = yield* request(
       operation,
-      endpoint(encodeURIComponent(fileId)),
+      target,
       authenticatedEmpty("DELETE"),
     )
     if (response.status === 204) return
@@ -703,7 +726,7 @@ export const makeFilesClient = (
     requestUpload,
     confirmUpload,
     requestDownload,
-    renameFile,
+    moveNode,
     softDelete,
     putFile,
     download,

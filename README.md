@@ -5,8 +5,9 @@ Cloudflare D1 and R2.
 
 The package is intentionally narrow: one isolated logical filesystem per
 workspace or account, a hierarchical D1 catalog, opaque R2 bytes, retry-safe
-folder creation and direct uploads, per-filesystem quota, signed downloads,
-subtree deletion, and bounded reclamation. It is not a POSIX API, generic blob
+folder creation and direct uploads, host-side writes and reads, declared
+SHA-256 digests, per-filesystem quota, signed downloads, subtree moves and
+deletion, a commit-ordered change log, and bounded reclamation. It is not a POSIX API, generic blob
 abstraction, or storage-vendor portability layer.
 
 ## Install
@@ -154,6 +155,45 @@ lifetime. It never places the API bearer token on a capability request and
 performs no hidden retry. `openBody` is a factory so the caller can decide
 whether a body is replayable.
 
+## Declared digests and media types
+
+`requestUpload` accepts an optional `sha256` and `contentType`. Both are signed
+into the upload capability. The data plane asks R2 to verify the digest, so
+different bytes are never stored (the PUT answers `400`). The signed media type
+is recorded whatever the upload request sends. Confirmation fails with
+`UploadChecksumMismatch` unless the declared digest is the one observed. The
+digest is part of the reservation fingerprint: replaying a key with a different
+digest is an `IdempotencyConflict`.
+
+## Host-side bytes
+
+`writeFile` stores bytes the host already holds, such as an email attachment or
+a generated report. It reserves under the caller's idempotency key, stores the
+bytes create-only with their computed SHA-256, and confirms, all as one
+command. A replay returns the ready file; a replay with different bytes is an
+`IdempotencyConflict`. `readFile` streams a ready file's bytes to the host
+without a capability.
+
+## Moves
+
+`move` moves a file or folder into another folder, renames it, or both. The
+whole subtree is rewritten in one guarded statement
+([ADR 0007](docs/adr/0007-moves-rewrite-the-subtree-in-one-statement.md)).
+Moving a folder into itself fails with `InvalidFileInput("move_into_itself")`.
+Every node a move touches gets a strictly later `updatedAt`, so passing
+`expectedUpdatedAt` to `move` or `softDelete` makes it conditional; a stale
+caller gets `StaleFileNode`.
+
+## Change log
+
+Triggers append every committed change to a folder or ready file to
+`popcomputer_file_changes`, in the same transaction
+([ADR 0006](docs/adr/0006-triggers-write-the-change-log.md)). The kinds are
+`folder_created`, `file_ready`, `node_moved` and `node_deleted`; moving or
+deleting a folder reports every visible node in its subtree. Read the log with
+`listChanges({ after, limit })` and keep the last `sequence` you processed.
+The reclaimer purges entries older than `changeRetentionMillis`.
+
 ## HTTP control plane
 
 `makeFilesHttpHandler` is framework-independent. Its authorizer returns a
@@ -166,8 +206,8 @@ parsed `{ fileSystemId, actor }` for `read`, `write`, or `delete`.
 | `POST` | `/files/upload-url` | `write` |
 | `POST` | `/files/:id/confirm` | `write` |
 | `GET` | `/files/:id/download` | `read` |
-| `PATCH` | `/files/:id` | `write` |
-| `DELETE` | `/files/:id` | `delete` |
+| `PATCH` | `/files/:id` (`{ name, parentId?, expectedUpdatedAt? }`) | `write` |
+| `DELETE` | `/files/:id?expectedUpdatedAt=` | `delete` |
 
 Lists accept `parentId` or `path`, plus keyset `cursor` and `limit`. The
 default page size is 50 and the maximum is 100. Mutation bodies reject excess
@@ -185,7 +225,8 @@ node is renamed or deleted between pages.
 
 ## D1 is authoritative
 
-Apply `migrations/d1/0001_files.sql` to the adapter database. An installed
+Apply `migrations/d1/0001_files.sql` and then
+`migrations/d1/0002_file_digests_and_changes.sql` to the adapter database. An installed
 package can resolve it with:
 
 ```ts
@@ -235,12 +276,17 @@ const objects = cloudflareFileObjectsLayer({
   capabilityOrigin: new URL("https://files.example.com"),
   signingSecret,
   capabilityPolicy,
+  // Optional: object keys are `{keyPrefix}{uuid}` (default `files/v1/`), and
+  // capabilities point at `{origin}{capabilityPath}{token}` (default `/o/`).
+  keyPrefix: "tenants/01JABC/files/",
+  capabilityPath: "/files-data/o/",
 })
 
 const objectHost = makeCloudflareFileDataPlaneHandler({
   bucket: env.FILES_BUCKET,
   signingSecret,
   capabilityPolicy,
+  capabilityPath: "/files-data/o/",
   allowedOrigins: ["https://app.example.com"],
 })
 ```
@@ -279,12 +325,17 @@ const maintenance = FileReclaimer.layer({
   metadataRetentionMillis: File.DurationMillisSchema.make(
     7 * 24 * 60 * 60 * 1000,
   ),
+  changeRetentionMillis: File.DurationMillisSchema.make(
+    30 * 24 * 60 * 60 * 1000,
+  ),
 })
 ```
 
 Run `runBatch()` on a recurring schedule, draining immediately eligible batches
-before calling `purgeMetadataBatch()` for the desired tombstone retention. An
-empty pass means no work is eligible at that instant; it does not retire the
+before calling `purgeMetadataBatch()` for the desired tombstone retention and
+`purgeChangesBatch()` for the change-log retention. `nextWorkAt()` returns the
+earliest instant any of them could make progress, so a host with a single alarm
+can set it there instead of polling. An empty pass means no work is eligible at that instant; it does not retire the
 schedule, because failed deletions may be waiting for their positive retry
 delay.
 
@@ -318,7 +369,8 @@ best effort and is not a security audit log.
 
 - Folders are always ready; zero-byte files are valid.
 - Only live ready bytes consume the logical per-filesystem quota.
-- Folders cannot be renamed in `0.1`; pending and ready file leaves can.
+- Names are at most 255 and paths at most 1024 Unicode code points; paths
+  have at most 32 segments.
 - Reclamation retry delays must be positive; metadata retention may be zero.
 - Deletion is recursive for a subtree and returns `FileNotFound` on repetition.
 - There is no POSIX compatibility surface, multipart upload, range API, full

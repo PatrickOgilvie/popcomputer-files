@@ -141,12 +141,15 @@ try {
   const installedPackage = join(consumerModules, "@popcomputer/files")
   for (const relativePath of [
     "migrations/d1/0001_files.sql",
+    "migrations/d1/0002_file_digests_and_changes.sql",
     "docs/architecture.md",
     "docs/adr/0001-separate-metadata-and-bytes.md",
     "docs/adr/0002-one-filesystem-is-one-boundary.md",
     "docs/adr/0003-upload-requests-outlive-file-nodes.md",
     "docs/adr/0004-d1-tombstones-drive-object-reclamation.md",
     "docs/adr/0005-folder-create-requests-outlive-folders.md",
+    "docs/adr/0006-triggers-write-the-change-log.md",
+    "docs/adr/0007-moves-rewrite-the-subtree-in-one-statement.md",
     "CHANGELOG.md",
     "README.md",
     "SECURITY.md",

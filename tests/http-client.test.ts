@@ -13,6 +13,8 @@ import {
   FileSystemIdSchema,
   IdempotencyKeySchema,
   PageSizeSchema,
+  Sha256Schema,
+  TimestampMillisSchema,
   rootListTarget,
 } from "../src/file.js"
 import {
@@ -299,6 +301,119 @@ describe("files HTTP handler and client", () => {
       }),
     ).toBeDefined()
   })
+
+  it.effect("moves, renames and conditionally deletes through the client", () =>
+    Effect.gen(function* () {
+      const files = yield* FileSystem
+      const handler = makeFilesHttpHandler({ fileSystem: files, authorizer })
+      const client = makeFilesClient({
+        baseUrl: new URL("https://api.invalid/files"),
+        apiToken: Redacted.make("test-token"),
+        fetch: handler,
+      })
+      const folder = (folderName: string) =>
+        client.createFolder({
+          parentId: null,
+          name: name(folderName),
+          idempotencyKey: IdempotencyKeySchema.make(`folder-${folderName}`),
+        })
+      const inbox = yield* folder("inbox")
+      const archive = yield* folder("archive")
+
+      const renamed = yield* client.moveNode({
+        fileId: inbox.id,
+        name: name("incoming"),
+      })
+      expect(renamed.path).toBe("incoming")
+      expect(renamed.parentId).toBeNull()
+
+      const moved = yield* client.moveNode({
+        fileId: inbox.id,
+        parentId: archive.id,
+        name: name("incoming"),
+        expectedUpdatedAt: renamed.updatedAt,
+      })
+      expect(moved.path).toBe("archive/incoming")
+
+      const stale = yield* Effect.flip(
+        client.moveNode({
+          fileId: inbox.id,
+          parentId: null,
+          name: name("inbox"),
+          expectedUpdatedAt: renamed.updatedAt,
+        }),
+      )
+      expect(stale.code).toBe("stale_file")
+
+      const intoItself = yield* Effect.flip(
+        client.moveNode({
+          fileId: archive.id,
+          parentId: inbox.id,
+          name: name("archive"),
+        }),
+      )
+      expect(intoItself.code).toBe("move_into_itself")
+
+      const staleDelete = yield* Effect.flip(
+        client.softDelete(archive.id, {
+          expectedUpdatedAt: TimestampMillisSchema.make(archive.updatedAt + 1),
+        }),
+      )
+      expect(staleDelete.code).toBe("stale_file")
+      yield* client.softDelete(archive.id, {
+        expectedUpdatedAt: archive.updatedAt,
+      })
+      const page = yield* client.listChildren({
+        target: rootListTarget,
+        page: { size: PageSizeSchema.make(50), cursor: null },
+      })
+      expect(page.items).toEqual([])
+    }).pipe(Effect.provide(runtimeLayer)),
+  )
+
+  it.effect("signs a declared digest and media type into the upload capability", () =>
+    Effect.gen(function* () {
+      const files = yield* FileSystem
+      const controls = yield* FileTestControl
+      const handler = makeFilesHttpHandler({ fileSystem: files, authorizer })
+      const client = makeFilesClient({
+        baseUrl: new URL("https://api.invalid/files"),
+        apiToken: Redacted.make("test-token"),
+        fetch: handler,
+      })
+      const sha256 = Sha256Schema.make("a".repeat(64))
+      yield* client.requestUpload({
+        parentId: null,
+        name: name("digest.txt"),
+        size: bytes(3),
+        idempotencyKey: IdempotencyKeySchema.make("digest-upload"),
+        sha256,
+      })
+      const issued = yield* controls.issuedCapabilities()
+      const upload = issued[issued.length - 1]
+      expect(upload?._tag === "Upload" ? upload.sha256 : null).toBe(sha256)
+
+      const invalid = yield* Effect.promise(() =>
+        handler(
+          new Request("https://api.invalid/files/upload-url", {
+            method: "POST",
+            headers: {
+              authorization: "Bearer test-token",
+              "content-type": "application/json",
+              "idempotency-key": "invalid-digest",
+            },
+            body: JSON.stringify({
+              parentId: null,
+              name: "bad.txt",
+              size: 1,
+              sha256: "not-a-digest",
+            }),
+          }),
+        ),
+      )
+      expect(invalid.status).toBe(400)
+    }).pipe(Effect.provide(runtimeLayer)),
+  )
 
   it.effect("runs reserve, capability PUT, confirm, and list without leaking API auth", () =>
     Effect.gen(function* () {

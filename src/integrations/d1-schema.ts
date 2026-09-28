@@ -41,6 +41,7 @@ export const d1Files = sqliteTable(
     deletedActorId: text("deleted_actor_id"),
     reclaimAfter: integer("reclaim_after"),
     objectReclaimedAt: integer("object_reclaimed_at"),
+    expectedSha256: text("expected_sha256"),
   },
   (table) => [
     primaryKey({
@@ -235,6 +236,7 @@ export const d1FileUploadRequests = sqliteTable(
     requestedName: text("requested_name").notNull(),
     requestedMaximumBytes: integer("requested_maximum_bytes").notNull(),
     createdAt: integer("created_at").notNull(),
+    requestedSha256: text("requested_sha256"),
   },
   (table) => [
     primaryKey({
@@ -261,6 +263,38 @@ export const d1FileUploadRequests = sqliteTable(
     ),
   ],
 )
+
+/** Commit-ordered log of visible changes, written by catalog triggers. */
+export const d1FileChanges = sqliteTable(
+  "popcomputer_file_changes",
+  {
+    sequence: integer("sequence").primaryKey({ autoIncrement: true }),
+    fileSystemId: text("file_system_id").notNull(),
+    kind: text("kind", {
+      enum: ["folder_created", "file_ready", "node_moved", "node_deleted"],
+    }).notNull(),
+    fileId: text("file_id").notNull(),
+    nodeKind: text("node_kind", { enum: ["folder", "file"] }).notNull(),
+    path: text("path").notNull(),
+    previousPath: text("previous_path"),
+    actorKind: text("actor_kind").notNull(),
+    actorId: text("actor_id").notNull(),
+    recordedAt: integer("recorded_at").notNull(),
+  },
+  (table) => [
+    index("popcomputer_file_changes_filesystem_idx").on(
+      table.fileSystemId,
+      table.sequence,
+    ),
+    index("popcomputer_file_changes_recorded_idx").on(
+      table.recordedAt,
+      table.sequence,
+    ),
+  ],
+)
+
+/** Drizzle-inferred persisted change-log row shape. */
+export type D1FileChangeRow = typeof d1FileChanges.$inferSelect
 
 /** Drizzle-inferred persisted file-row shape. */
 export type D1FileRow = typeof d1Files.$inferSelect

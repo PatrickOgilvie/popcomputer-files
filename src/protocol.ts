@@ -10,6 +10,7 @@ import {
   IdempotencyKeySchema,
   PageCursorSchema,
   RelativePathSchema,
+  Sha256Schema,
   TimestampMillisSchema,
   type DownloadTicket,
   type FileNode,
@@ -17,7 +18,8 @@ import {
   type UploadTicket,
 } from "./file.js"
 
-const isoTimestamp = Schema.String.check(
+/** Canonical ISO-8601 timestamp with millisecond precision, as responses carry. */
+export const IsoTimestampSchema = Schema.String.check(
   Schema.makeFilter(
     (value: string) => {
       const timestamp = Date.parse(value)
@@ -36,8 +38,8 @@ const dtoBase = {
   name: FileNameSchema,
   parentId: Schema.NullOr(FileIdSchema),
   path: RelativePathSchema,
-  createdAt: isoTimestamp,
-  updatedAt: isoTimestamp,
+  createdAt: IsoTimestampSchema,
+  updatedAt: IsoTimestampSchema,
 }
 
 const FolderNodeDtoSchema = Schema.Struct({
@@ -97,16 +99,27 @@ export const RequestUploadBodySchema = Schema.Struct({
   parentId: Schema.NullOr(FileIdSchema),
   name: Schema.String,
   size: ByteCountSchema,
+  /** Optional SHA-256 the stored bytes must have. */
+  sha256: Schema.optionalKey(Schema.NullOr(Sha256Schema)),
+  /** Optional media type recorded whatever the upload request sends. */
+  contentType: Schema.optionalKey(Schema.NullOr(FileContentTypeSchema)),
 })
 
-/** Strict rename request body before file-name normalization. */
-export const RenameFileBodySchema = Schema.Struct({ name: Schema.String })
+/**
+ * Strict move request body before file-name normalization. Without
+ * `parentId` the node stays in its folder and is only renamed.
+ */
+export const MoveNodeBodySchema = Schema.Struct({
+  name: Schema.String,
+  parentId: Schema.optionalKey(Schema.NullOr(FileIdSchema)),
+  expectedUpdatedAt: Schema.optionalKey(IsoTimestampSchema),
+})
 
 /** Strict upload-ticket response. */
 export const UploadTicketDtoSchema = Schema.Struct({
   fileId: FileIdSchema,
   uploadUrl: CapabilityUrlSchema,
-  expiresAt: isoTimestamp,
+  expiresAt: IsoTimestampSchema,
 })
 /** Strict upload-ticket response. */
 export type UploadTicketDto = Schema.Schema.Type<
@@ -117,18 +130,18 @@ export type UploadTicketDto = Schema.Schema.Type<
 export const DownloadTicketDtoSchema = Schema.Struct({
   file: ReadyFileNodeDtoSchema,
   url: CapabilityUrlSchema,
-  expiresAt: isoTimestamp,
+  expiresAt: IsoTimestampSchema,
 })
 /** Strict download-ticket response. */
 export type DownloadTicketDto = Schema.Schema.Type<
   typeof DownloadTicketDtoSchema
 >
 
-/** Strict node response used by create, confirm, and rename. */
+/** Strict node response used by create, confirm, and move. */
 export const FileNodeResponseDtoSchema = Schema.Struct({
   node: FileNodeDtoSchema,
 })
-/** Strict node response used by create, confirm, and rename. */
+/** Strict node response used by create, confirm, and move. */
 export type FileNodeResponseDto = Schema.Schema.Type<
   typeof FileNodeResponseDtoSchema
 >
@@ -197,7 +210,8 @@ export const fileNodeToDto = (node: FileNode): FileNodeDto => {
   }
 }
 
-const timestampFromIso = (value: string) =>
+/** Millisecond timestamp of a strictly decoded ISO-8601 string. */
+export const timestampFromIso = (value: string) =>
   TimestampMillisSchema.make(Date.parse(value))
 
 /** Reconstruct one domain node from a strictly decoded response DTO. */

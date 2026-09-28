@@ -62,8 +62,9 @@ describe("FileSystem concurrency", () => {
       createFolder: () => unexpected("createFolder"),
       reserveUpload: () => unexpected("reserveUpload"),
       confirmUpload: () => unexpected("confirmUpload"),
-      renameFile: () => unexpected("renameFile"),
+      move: () => unexpected("move"),
       softDelete: () => unexpected("softDelete"),
+      listChanges: () => unexpected("listChanges"),
     })
     const objects = FileObjects.of({
       uploadCapabilityTtlMillis: 60_000,
@@ -71,6 +72,8 @@ describe("FileSystem concurrency", () => {
       locationFor: () => locator,
       stat: () => unexpected("stat"),
       issueUpload: () => unexpected("issueUpload"),
+      put: () => unexpected("put"),
+      get: () => unexpected("get"),
       issueDownload: () =>
         Effect.sync(() => {
           issued += 1
