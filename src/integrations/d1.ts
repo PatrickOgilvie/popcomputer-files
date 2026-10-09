@@ -13,12 +13,12 @@ import {
 import { drizzle } from "drizzle-orm/sqlite-proxy"
 import {
   Effect,
-  Encoding,
   Layer,
   Option,
   Result,
   Schema,
 } from "effect"
+import { Base64Url } from "effect/encoding"
 import {
   FileCatalog,
   FileObjectLocatorSchema,
@@ -821,7 +821,7 @@ const encodeCursor = (
   node: StoredFileNode,
 ): PageCursor =>
   PageCursorSchema.make(
-    Encoding.encodeBase64Url(
+    Base64Url.encode(
       JSON.stringify({
         version: 1,
         fileSystemId,
@@ -834,7 +834,7 @@ const encodeCursor = (
   )
 
 const decodeCursor = (cursor: PageCursor): CursorPayload | null => {
-  const text = Result.getOrNull(Encoding.decodeBase64UrlString(cursor))
+  const text = Result.getOrNull(Base64Url.decodeString(cursor))
   if (text === null) return null
   return Option.getOrNull(
     Schema.decodeUnknownOption(CursorPayloadFromStringSchema)(text),

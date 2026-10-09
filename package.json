@@ -100,7 +100,7 @@
   },
   "peerDependencies": {
     "drizzle-orm": "^0.45.2",
-    "effect": "^4.0.0-rc.116"
+    "effect": "^4.0.0"
   },
   "peerDependenciesMeta": {
     "drizzle-orm": {
@@ -110,10 +110,10 @@
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.0.0",
     "@cloudflare/workers-types": "^5.20260820.1",
-    "@effect/vitest": "4.0.0-rc.116",
+    "@effect/vitest": "4.0.2",
     "@types/node": "^24.3.0",
     "drizzle-orm": "0.45.2",
-    "effect": "4.0.0-rc.116",
+    "effect": "4.0.2",
     "oxlint": "1.78.0",
     "typescript": "^5.9.3",
     "vitest": "4.1.0"

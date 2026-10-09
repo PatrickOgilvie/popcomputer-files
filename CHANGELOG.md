@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Effect `4.0.2`. The `effect` peer range is now `^4.0.0`, so Effect 4
+  release candidates are no longer supported.
+
+
 ## 0.2.0
 
 - **Moves.** `FileSystem.move` replaces `renameFile`: files and folders move

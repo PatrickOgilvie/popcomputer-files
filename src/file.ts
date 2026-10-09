@@ -21,35 +21,36 @@ const hasInvalidCodePoint = (value: string): boolean => {
   return false
 }
 
-const identifier = <const Brand extends string>(brand: Brand) =>
-  Schema.String.check(
-    Schema.isNonEmpty(),
-    Schema.isMaxLength(200),
-    Schema.isPattern(identifierPattern),
-  ).pipe(Schema.brand(brand))
+const IdentifierSchema = Schema.String.check(
+  Schema.isNonEmpty(),
+  Schema.isMaxLength(200),
+  Schema.isPattern(identifierPattern),
+)
 
 /** Opaque identity of one file or folder. */
-export const FileIdSchema = identifier("@popcomputer/files/FileId")
+export const FileIdSchema = IdentifierSchema.pipe(
+  Schema.brand("@popcomputer/files/FileId"),
+)
 /** Opaque identity of one file or folder. */
 export type FileId = Schema.Schema.Type<typeof FileIdSchema>
 
 /** Stable identity of one isolated logical filesystem. */
-export const FileSystemIdSchema = identifier(
-  "@popcomputer/files/FileSystemId",
+export const FileSystemIdSchema = IdentifierSchema.pipe(
+  Schema.brand("@popcomputer/files/FileSystemId"),
 )
 /** Stable identity of one isolated logical filesystem. */
 export type FileSystemId = Schema.Schema.Type<typeof FileSystemIdSchema>
 
 /** Opaque identity of the actor performing one operation. */
-export const FileActorIdSchema = identifier(
-  "@popcomputer/files/FileActorId",
+export const FileActorIdSchema = IdentifierSchema.pipe(
+  Schema.brand("@popcomputer/files/FileActorId"),
 )
 /** Opaque identity of the actor performing one operation. */
 export type FileActorId = Schema.Schema.Type<typeof FileActorIdSchema>
 
 /** Application-defined actor category. */
-export const FileActorKindSchema = identifier(
-  "@popcomputer/files/FileActorKind",
+export const FileActorKindSchema = IdentifierSchema.pipe(
+  Schema.brand("@popcomputer/files/FileActorKind"),
 )
 /** Application-defined actor category. */
 export type FileActorKind = Schema.Schema.Type<typeof FileActorKindSchema>
