@@ -1,6 +1,6 @@
 {
   "name": "@popcomputer/files",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Effect-native filesystem primitives for Cloudflare D1 and R2",
   "type": "module",
   "packageManager": "bun@1.3.1",

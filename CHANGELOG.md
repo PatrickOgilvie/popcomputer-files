@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - Effect `4.0.2`. The `effect` peer range is now `^4.0.0`, so Effect 4
   release candidates are no longer supported.
