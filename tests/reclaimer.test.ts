@@ -44,6 +44,7 @@ const policy = FileReclaimerPolicySchema.make({
   concurrency: 2,
   retryDelayMillis: DurationMillisSchema.make(1_000),
   metadataRetentionMillis: DurationMillisSchema.make(0),
+  changeRetentionMillis: DurationMillisSchema.make(0),
 })
 const runtimeLayer = Layer.merge(
   fileSystemLayer({ maximumUploadBytes: bytes(100) }),

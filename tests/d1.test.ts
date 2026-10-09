@@ -30,10 +30,11 @@ import {
   type FileSystemId,
 } from "../src/file.js"
 
-const migration = readFileSync(
-  new URL("../migrations/d1/0001_files.sql", import.meta.url),
-  "utf8",
-)
+const migration = ["0001_files.sql", "0002_file_digests_and_changes.sql"]
+  .map((name) =>
+    readFileSync(new URL(`../migrations/d1/${name}`, import.meta.url), "utf8"),
+  )
+  .join("\n")
 
 const actor = FileActorSchema.make({
   kind: FileActorKindSchema.make("user"),
@@ -184,6 +185,7 @@ const uploadInput = (input: {
   locator: locator(input.objectLocator ?? `object:${input.suffix}`),
   maximumBytes: bytes(input.maximumBytes ?? 10),
   pendingExpiresAt: timestamp(input.pendingExpiresAt ?? 100),
+  expectedSha256: null,
 })
 
 describe("D1 file catalog", () => {
@@ -355,6 +357,7 @@ describe("D1 file catalog", () => {
           now: timestamp(4),
           fileId: beta.node.id,
           reclaimAfter: timestamp(100),
+          expectedUpdatedAt: null,
         })
         expect(deletedAnchor._tag).toBe("Deleted")
         const second = yield* catalog.listChildren(
@@ -477,6 +480,7 @@ describe("D1 file catalog", () => {
               now: timestamp(20),
               fileId: created.node.id,
               reclaimAfter: timestamp(20),
+              expectedUpdatedAt: null,
             })
           )._tag,
         ).toBe("Deleted")
@@ -541,14 +545,16 @@ describe("D1 file catalog", () => {
           return yield* Effect.die("expected upload reservation")
         }
 
-        const renamed = yield* catalog.renameFile({
+        const renamed = yield* catalog.move({
           fileSystemId: fileSystemA,
           actor,
           now: timestamp(20),
           fileId: created.node.id,
+          parentId: null,
           name: fileName("renamed.txt"),
+          expectedUpdatedAt: null,
         })
-        expect(renamed._tag).toBe("Renamed")
+        expect(renamed._tag).toBe("Moved")
         const pendingReplay = yield* catalog.reserveUpload({
           ...original,
           id: fileId("ignored-replay-id"),
@@ -599,6 +605,7 @@ describe("D1 file catalog", () => {
           now: timestamp(40),
           fileId: created.node.id,
           reclaimAfter: timestamp(200),
+          expectedUpdatedAt: null,
         })
         expect(deleted._tag).toBe("Deleted")
         const deletedReplay = yield* catalog.reserveUpload({
@@ -913,6 +920,284 @@ describe("D1 file catalog", () => {
     withLocalD1((local) =>
       Effect.sync(() => {
         expect(d1FileCatalogLayer(local.binding)).toBeDefined()
+      }),
+    ),
+  )
+})
+
+describe("D1 moves, deletes and change log", () => {
+  const folder = (
+    catalog: ReturnType<typeof makeD1FileCatalog>,
+    id: string,
+    parentId: string | null,
+    now: number,
+  ) =>
+    catalog
+      .createFolder({
+        fileSystemId: fileSystemA,
+        actor,
+        now: timestamp(now),
+        id: fileId(id),
+        parentId: parentId === null ? null : fileId(parentId),
+        name: fileName(id),
+        idempotencyKey: idempotencyKey(`folder-${id}`),
+      })
+      .pipe(
+        Effect.flatMap((result) =>
+          result._tag === "Created"
+            ? Effect.succeed(result.node)
+            : Effect.die(`expected folder ${id}, got ${result._tag}`),
+        ),
+      )
+
+  const readyFile = (
+    catalog: ReturnType<typeof makeD1FileCatalog>,
+    suffix: string,
+    parentId: string,
+    now: number,
+  ) =>
+    Effect.gen(function* () {
+      const reserved = yield* catalog.reserveUpload(
+        uploadInput({
+          fileSystemId: fileSystemA,
+          suffix,
+          parentId: fileId(parentId),
+          now,
+        }),
+      )
+      if (reserved._tag !== "Created") {
+        return yield* Effect.die("expected reservation")
+      }
+      const confirmed = yield* catalog.confirmUpload({
+        fileSystemId: fileSystemA,
+        actor,
+        now: timestamp(now + 1),
+        fileId: reserved.node.id,
+        size: bytes(1),
+        contentType: null,
+        digest: null,
+        quotaBytes: bytes(1_000),
+      })
+      if (confirmed._tag !== "Confirmed") {
+        return yield* Effect.die("expected confirmation")
+      }
+      return confirmed.node
+    })
+
+  const moveInput = (
+    id: string,
+    parentId: string | null,
+    name: string,
+    now: number,
+    expectedUpdatedAt: number | null = null,
+  ) => ({
+    fileSystemId: fileSystemA,
+    actor,
+    now: timestamp(now),
+    fileId: fileId(id),
+    parentId: parentId === null ? null : fileId(parentId),
+    name: fileName(name),
+    expectedUpdatedAt:
+      expectedUpdatedAt === null ? null : timestamp(expectedUpdatedAt),
+  })
+
+  it.effect("moves a folder subtree in one statement and logs each visible node", () =>
+    withLocalD1((local) =>
+      Effect.gen(function* () {
+        const catalog = makeD1FileCatalog(local.binding)
+        yield* folder(catalog, "a", null, 1)
+        yield* folder(catalog, "b", "a", 2)
+        yield* folder(catalog, "c", null, 3)
+        const file = yield* readyFile(catalog, "f", "b", 4)
+        yield* catalog.reserveUpload(
+          uploadInput({
+            fileSystemId: fileSystemA,
+            suffix: "pending",
+            parentId: fileId("b"),
+            now: 6,
+          }),
+        )
+
+        const moved = yield* catalog.move(moveInput("a", "c", "a2", 10))
+        expect(moved._tag).toBe("Moved")
+        const paths = local.sqlite
+          .prepare(
+            "SELECT id, path FROM popcomputer_files WHERE deleted_at IS NULL ORDER BY path",
+          )
+          .all()
+          .map((row) => `${String(row["id"])}:${String(row["path"])}`)
+        expect(paths).toEqual([
+          "c:c",
+          "a:c/a2",
+          "b:c/a2/b",
+          `${file.id}:c/a2/b/f.txt`,
+          "file-pending:c/a2/b/pending.txt",
+        ])
+
+        const page = yield* catalog.listChanges(fileSystemA, null, pageSize(100))
+        const described = page.changes.map((change) =>
+          change.previousPath === null
+            ? `${change.kind} ${change.path}`
+            : `${change.kind} ${change.previousPath} -> ${change.path}`,
+        )
+        expect(described.slice(0, 4)).toEqual([
+          "folder_created a",
+          "folder_created a/b",
+          "folder_created c",
+          "file_ready a/b/f.txt",
+        ])
+        // One statement's rows are logged in the engine's row order.
+        expect(described.slice(4).sort()).toEqual([
+          "node_moved a -> c/a2",
+          "node_moved a/b -> c/a2/b",
+          "node_moved a/b/f.txt -> c/a2/b/f.txt",
+        ])
+        expect(page.more).toBe(false)
+        expect(
+          (yield* catalog.listChanges(fileSystemB, null, pageSize(100)))
+            .changes,
+        ).toEqual([])
+      }),
+    ),
+  )
+
+  it.effect("rejects cycles, conflicts, stale moves and over-deep subtrees", () =>
+    withLocalD1((local) =>
+      Effect.gen(function* () {
+        const catalog = makeD1FileCatalog(local.binding)
+        const a = yield* folder(catalog, "a", null, 1)
+        yield* folder(catalog, "b", "a", 2)
+        yield* folder(catalog, "x", null, 3)
+
+        expect((yield* catalog.move(moveInput("a", "b", "a", 10)))._tag).toBe(
+          "Cycle",
+        )
+        expect((yield* catalog.move(moveInput("a", "a", "a", 10)))._tag).toBe(
+          "Cycle",
+        )
+        expect((yield* catalog.move(moveInput("a", null, "x", 10)))._tag).toBe(
+          "NameConflict",
+        )
+        expect(
+          (yield* catalog.move(moveInput("a", null, "a3", 10, a.updatedAt + 5)))
+            ._tag,
+        ).toBe("Stale")
+        expect((yield* catalog.move(moveInput("a", null, "a", 10)))._tag).toBe(
+          "Unchanged",
+        )
+
+        let parent: string | null = null
+        for (let depth = 1; depth <= 31; depth += 1) {
+          const id = `d${depth}`
+          yield* folder(catalog, id, parent, 20 + depth)
+          parent = id
+        }
+        expect((yield* catalog.move(moveInput("x", "d31", "x", 60)))._tag).toBe(
+          "Moved",
+        )
+        expect((yield* catalog.move(moveInput("a", "d30", "a", 61)))._tag).toBe(
+          "Moved",
+        )
+        expect((yield* catalog.move(moveInput("a", "d31", "a", 62)))._tag).toBe(
+          "InvalidPath",
+        )
+      }),
+    ),
+  )
+
+  it.effect("deletes the subtree a node heads when it is deleted, even after a move", () =>
+    withLocalD1((local) =>
+      Effect.gen(function* () {
+        const catalog = makeD1FileCatalog(local.binding)
+        yield* folder(catalog, "p", null, 1)
+        yield* folder(catalog, "q", null, 2)
+        yield* readyFile(catalog, "child", "p", 3)
+        const moved = yield* catalog.move(moveInput("p", "q", "p", 10))
+        if (moved._tag !== "Moved") return yield* Effect.die("expected move")
+
+        const stale = yield* catalog.softDelete({
+          fileSystemId: fileSystemA,
+          actor,
+          now: timestamp(20),
+          fileId: fileId("p"),
+          reclaimAfter: timestamp(100),
+          expectedUpdatedAt: timestamp(1),
+        })
+        expect(stale._tag).toBe("Stale")
+
+        const deleted = yield* catalog.softDelete({
+          fileSystemId: fileSystemA,
+          actor,
+          now: timestamp(21),
+          fileId: fileId("p"),
+          reclaimAfter: timestamp(100),
+          expectedUpdatedAt: moved.node.updatedAt,
+        })
+        expect(deleted._tag).toBe("Deleted")
+        const live = local.sqlite
+          .prepare(
+            "SELECT path FROM popcomputer_files WHERE deleted_at IS NULL ORDER BY path",
+          )
+          .all()
+          .map((row) => String(row["path"]))
+        expect(live).toEqual(["q"])
+
+        const changes = yield* catalog.listChanges(
+          fileSystemA,
+          null,
+          pageSize(100),
+        )
+        expect(
+          changes.changes
+            .filter((change) => change.kind === "node_deleted")
+            .map((change) => change.path)
+            .sort(),
+        ).toEqual(["q/p", "q/p/child.txt"])
+      }),
+    ),
+  )
+
+  it.effect("reports maintenance due times and purges old changes", () =>
+    withLocalD1((local) =>
+      Effect.gen(function* () {
+        const catalog = makeD1FileCatalog(local.binding)
+        const reclamation = makeD1FileReclamationCatalog(local.binding)
+        expect(yield* reclamation.maintenanceDue()).toEqual({
+          pendingExpiresAt: null,
+          reclaimAfter: null,
+          reclaimedDeletedAt: null,
+          oldestChangeAt: null,
+        })
+        yield* folder(catalog, "f", null, 5)
+        yield* catalog.reserveUpload(
+          uploadInput({
+            fileSystemId: fileSystemA,
+            suffix: "due",
+            now: 6,
+            pendingExpiresAt: 50,
+          }),
+        )
+        expect(yield* reclamation.maintenanceDue()).toEqual({
+          pendingExpiresAt: 50,
+          reclaimAfter: null,
+          reclaimedDeletedAt: null,
+          oldestChangeAt: 5,
+        })
+        expect(
+          yield* reclamation.purgeChangesBatch({
+            recordedBefore: timestamp(5),
+            limit: batchSize(10),
+          }),
+        ).toBe(0)
+        expect(
+          yield* reclamation.purgeChangesBatch({
+            recordedBefore: timestamp(6),
+            limit: batchSize(10),
+          }),
+        ).toBe(1)
+        yield* folder(catalog, "g", null, 7)
+        const after = yield* catalog.listChanges(fileSystemA, null, pageSize(10))
+        expect(after.changes.map((change) => change.sequence)).toEqual([2])
       }),
     ),
   )

@@ -22,8 +22,8 @@ import {
   type CatalogCreateFolderResult,
   type CatalogFilePage,
   type CatalogListChildrenResult,
-  type CatalogRenameFileInput,
-  type CatalogRenameFileResult,
+  type CatalogMoveInput,
+  type CatalogMoveResult,
   type CatalogReserveUploadInput,
   type CatalogReserveUploadResult,
   type CatalogSoftDeleteInput,
@@ -41,13 +41,19 @@ import {
   InvalidStoredFile,
 } from "./errors.js"
 import {
+  ByteCountSchema,
   CapabilityUrlSchema,
+  FileChangeSequenceSchema,
   FileIdSchema,
   PageCursorSchema,
   TimestampMillisSchema,
   childPath,
-  replacePathLeaf,
+  parseRelativePath,
   type ByteCount,
+  type FileActor,
+  type FileChange,
+  type FileChangePage,
+  type FileChangeSequence,
   type FileId,
   type FileListTarget,
   type FileName,
@@ -57,6 +63,7 @@ import {
   type PageCursor,
   type PageSize,
   type RelativePath,
+  type Sha256,
   type TimestampMillis,
 } from "./file.js"
 import {
@@ -79,6 +86,7 @@ interface UploadLedgerEntry {
   readonly parentId: FileId | null
   readonly name: FileName
   readonly maximumBytes: ByteCount
+  readonly sha256: Sha256 | null
 }
 
 interface FolderLedgerEntry {
@@ -89,16 +97,24 @@ interface FolderLedgerEntry {
   readonly name: FileName
 }
 
+interface ChangeEntry {
+  readonly fileSystemId: FileSystemId
+  readonly change: FileChange
+}
+
 interface CatalogState {
   readonly records: ReadonlyMap<string, CatalogRecord>
   readonly folders: ReadonlyMap<string, FolderLedgerEntry>
   readonly uploads: ReadonlyMap<string, UploadLedgerEntry>
   readonly cursors: ReadonlyMap<PageCursor, StoredCursor>
   readonly nextCursor: number
+  readonly changes: ReadonlyArray<ChangeEntry>
+  readonly nextChangeSequence: number
 }
 
 interface ObjectState {
   readonly metadata: ReadonlyMap<FileObjectLocator, FileObjectMetadata>
+  readonly bytes: ReadonlyMap<FileObjectLocator, Uint8Array<ArrayBuffer>>
   readonly capabilities: ReadonlyArray<TestIssuedFileCapability>
   readonly deleteAttempts: ReadonlyArray<FileObjectLocator>
   readonly nextCapability: number
@@ -313,6 +329,69 @@ const putCatalogRecord = (
   return { ...state, records }
 }
 
+/** Visible nodes are folders and ready files; pending uploads are never reported. */
+const isVisible = (node: StoredFileNode): boolean =>
+  node._tag !== "PendingFile"
+
+type ChangeInput = Omit<FileChange, "sequence">
+
+/** Append changes in commit order, as the D1 triggers do inside a transaction. */
+const appendChanges = (
+  state: CatalogState,
+  fileSystemId: FileSystemId,
+  changes: ReadonlyArray<ChangeInput>,
+): CatalogState => {
+  let sequence = state.nextChangeSequence
+  const appended = changes.map((change): ChangeEntry => {
+    const entry: ChangeEntry = {
+      fileSystemId,
+      change: { ...change, sequence: FileChangeSequenceSchema.make(sequence) },
+    }
+    sequence += 1
+    return entry
+  })
+  return {
+    ...state,
+    changes: [...state.changes, ...appended],
+    nextChangeSequence: sequence,
+  }
+}
+
+const nodeKindOf = (node: StoredFileNode): "folder" | "file" =>
+  node._tag === "Folder" ? "folder" : "file"
+
+const laterThan = (
+  now: TimestampMillis,
+  previous: TimestampMillis,
+): TimestampMillis => TimestampMillisSchema.make(Math.max(now, previous + 1))
+
+const minimum = (
+  values: ReadonlyArray<TimestampMillis | null>,
+): TimestampMillis | null => {
+  const present = values.filter(
+    (value): value is TimestampMillis => value !== null,
+  )
+  return present.length === 0
+    ? null
+    : TimestampMillisSchema.make(Math.min(...present))
+}
+
+const changeAt = (
+  kind: FileChange["kind"],
+  node: StoredFileNode,
+  actor: FileActor,
+  at: TimestampMillis,
+  previousPath: RelativePath | null = null,
+): ChangeInput => ({
+  kind,
+  fileId: node.id,
+  nodeKind: nodeKindOf(node),
+  path: node.path,
+  previousPath,
+  actor,
+  at,
+})
+
 const orderNodesByPath = (
   left: StoredFileNode,
   right: StoredFileNode,
@@ -340,9 +419,12 @@ export const layer = (): Layer.Layer<
         uploads: new Map(),
         cursors: new Map(),
         nextCursor: 1,
+        changes: [],
+        nextChangeSequence: 1,
       })
       const objectState = yield* Ref.make<ObjectState>({
         metadata: new Map(),
+        bytes: new Map(),
         capabilities: [],
         deleteAttempts: [],
         nextCapability: 1,
@@ -556,7 +638,12 @@ export const layer = (): Layer.Layer<
                 _tag: "Created",
                 node,
               }
-              return [result, { ...withRecord, folders }] as const
+              return [
+                result,
+                appendChanges({ ...withRecord, folders }, input.fileSystemId, [
+                  changeAt("folder_created", node, input.actor, input.now),
+                ]),
+              ] as const
             }),
         )
       })
@@ -582,7 +669,8 @@ export const layer = (): Layer.Layer<
                 const sameFingerprint =
                   replay.parentId === input.parentId &&
                   replay.name === input.name &&
-                  replay.maximumBytes === input.maximumBytes
+                  replay.maximumBytes === input.maximumBytes &&
+                  replay.sha256 === input.expectedSha256
                 if (!sameFingerprint) {
                   const result: CatalogReserveUploadResult = {
                     _tag: "IdempotencyConflict",
@@ -686,6 +774,7 @@ export const layer = (): Layer.Layer<
                 locator: input.locator,
                 maximumBytes: input.maximumBytes,
                 pendingExpiresAt: input.pendingExpiresAt,
+                expectedSha256: input.expectedSha256,
               })
               const withRecord = putCatalogRecord(state, {
                 fileSystemId: input.fileSystemId,
@@ -702,6 +791,7 @@ export const layer = (): Layer.Layer<
                 parentId: input.parentId,
                 name: input.name,
                 maximumBytes: input.maximumBytes,
+                sha256: input.expectedSha256,
               })
               const next: CatalogState = { ...withRecord, uploads }
               const result: CatalogReserveUploadResult = {
@@ -777,7 +867,7 @@ export const layer = (): Layer.Layer<
                 name: record.node.name,
                 path: record.node.path,
                 createdAt: record.node.createdAt,
-                updatedAt: input.now,
+                updatedAt: laterThan(input.now, record.node.updatedAt),
                 locator: record.node.locator,
                 maximumBytes: record.node.maximumBytes,
                 size: input.size,
@@ -799,10 +889,11 @@ export const layer = (): Layer.Layer<
                 )
               }
 
-              const next = putCatalogRecord(state, {
-                ...record,
-                node: decoded,
-              })
+              const next = appendChanges(
+                putCatalogRecord(state, { ...record, node: decoded }),
+                input.fileSystemId,
+                [changeAt("file_ready", decoded, input.actor, decoded.updatedAt)],
+              )
               const result: CatalogConfirmUploadResult = {
                 _tag: "Confirmed",
                 node: decoded,
@@ -812,92 +903,135 @@ export const layer = (): Layer.Layer<
         )
       })
 
-      const renameFile = Effect.fn(
-        "InMemoryFileCatalog.renameFile",
-      )(function* (input: CatalogRenameFileInput) {
+      const move = Effect.fn("InMemoryFileCatalog.move")(function* (
+        input: CatalogMoveInput,
+      ) {
         return yield* SynchronizedRef.modifyEffect<
           CatalogState,
-          CatalogRenameFileResult,
+          CatalogMoveResult,
           never,
           never
         >(
           catalogState,
           (state) =>
             Effect.gen(function* () {
+              const unchanged = (result: CatalogMoveResult) =>
+                [result, state] as const
               const record = findLiveRecord(
                 state,
                 input.fileSystemId,
                 input.fileId,
               )
-              if (record === null) {
-                const result: CatalogRenameFileResult = { _tag: "NotFound" }
-                return [result, state] as const
+              if (record === null) return unchanged({ _tag: "NotFound" })
+              if (
+                input.expectedUpdatedAt !== null &&
+                record.node.updatedAt !== input.expectedUpdatedAt
+              ) {
+                return unchanged({ _tag: "Stale", node: record.node })
               }
-              if (record.node._tag === "Folder") {
-                const result: CatalogRenameFileResult = {
-                  _tag: "FolderNotSupported",
-                }
-                return [result, state] as const
+              if (
+                record.node.parentId === input.parentId &&
+                record.node.name === input.name
+              ) {
+                return unchanged({ _tag: "Unchanged", node: record.node })
               }
+              if (input.parentId === input.fileId) {
+                return unchanged({ _tag: "Cycle" })
+              }
+              const parent = parentPath(
+                state,
+                input.fileSystemId,
+                input.parentId,
+              )
+              if (parent._tag !== "Parent") return unchanged(parent)
+              const oldPath = record.node.path
+              if (
+                parent.path !== null &&
+                (parent.path === oldPath ||
+                  parent.path.startsWith(`${oldPath}/`))
+              ) {
+                return unchanged({ _tag: "Cycle" })
+              }
+              const maybePath = yield* Effect.option(
+                childPath(parent.path, input.name),
+              )
+              if (Option.isNone(maybePath)) {
+                return unchanged({ _tag: "InvalidPath" })
+              }
+              const newPath = maybePath.value
               if (
                 hasSiblingName(
                   state,
                   input.fileSystemId,
-                  record.node.parentId,
+                  input.parentId,
                   input.name,
                   record.node.id,
+                ) ||
+                liveRecords(state, input.fileSystemId).some(
+                  (candidate) =>
+                    candidate.node.id !== record.node.id &&
+                    candidate.node.path === newPath,
                 )
               ) {
-                const result: CatalogRenameFileResult = {
-                  _tag: "NameConflict",
-                }
-                return [result, state] as const
+                return unchanged({ _tag: "NameConflict" })
               }
 
-              const maybePath = yield* Effect.option(
-                replacePathLeaf(record.node.path, input.name),
+              const subtree = liveRecords(state, input.fileSystemId).filter(
+                (candidate) =>
+                  candidate.node.id === record.node.id ||
+                  candidate.node.path.startsWith(`${oldPath}/`),
               )
-              if (Option.isNone(maybePath)) {
-                const result: CatalogRenameFileResult = {
-                  _tag: "InvalidPath",
+              const moved: Array<CatalogRecord> = []
+              for (const member of subtree) {
+                const isRoot = member.node.id === record.node.id
+                const path = isRoot
+                  ? Option.some(newPath)
+                  : yield* Effect.option(
+                      parseRelativePath(
+                        `${newPath}${member.node.path.slice(oldPath.length)}`,
+                      ),
+                    )
+                if (Option.isNone(path)) {
+                  return unchanged({ _tag: "InvalidPath" })
                 }
-                return [result, state] as const
+                const node: StoredFileNode = {
+                  ...member.node,
+                  ...(isRoot
+                    ? { parentId: input.parentId, name: input.name }
+                    : {}),
+                  path: path.value,
+                  updatedAt: laterThan(input.now, member.node.updatedAt),
+                }
+                moved.push({ ...member, node })
               }
 
-              const renamed =
-                record.node._tag === "PendingFile"
-                  ? StoredFileNodeSchema.cases.PendingFile.make({
-                      id: record.node.id,
-                      parentId: record.node.parentId,
-                      name: input.name,
-                      path: maybePath.value,
-                      createdAt: record.node.createdAt,
-                      updatedAt: input.now,
-                      locator: record.node.locator,
-                      maximumBytes: record.node.maximumBytes,
-                      pendingExpiresAt: record.node.pendingExpiresAt,
-                    })
-                  : StoredFileNodeSchema.cases.ReadyFile.make({
-                      id: record.node.id,
-                      parentId: record.node.parentId,
-                      name: input.name,
-                      path: maybePath.value,
-                      createdAt: record.node.createdAt,
-                      updatedAt: input.now,
-                      locator: record.node.locator,
-                      maximumBytes: record.node.maximumBytes,
-                      size: record.node.size,
-                      contentType: record.node.contentType,
-                      digest: record.node.digest,
-                    })
-              const next = putCatalogRecord(state, {
-                ...record,
-                node: renamed,
-              })
-              const result: CatalogRenameFileResult = {
-                _tag: "Renamed",
-                node: renamed,
+              let next = state
+              const changes: Array<ChangeInput> = []
+              for (const member of moved) {
+                next = putCatalogRecord(next, member)
+                const before = subtree.find(
+                  (candidate) => candidate.node.id === member.node.id,
+                )
+                if (before !== undefined && isVisible(member.node)) {
+                  changes.push(
+                    changeAt(
+                      "node_moved",
+                      member.node,
+                      input.actor,
+                      member.node.updatedAt,
+                      before.node.path,
+                    ),
+                  )
+                }
               }
+              next = appendChanges(next, input.fileSystemId, changes)
+              const root = moved.find(
+                (member) => member.node.id === record.node.id,
+              )
+              const result: CatalogMoveResult =
+                root === undefined
+                  ? { _tag: "NotFound" }
+                  : { _tag: "Moved", node: root.node }
               return [result, next] as const
             }),
         )
@@ -919,6 +1053,16 @@ export const layer = (): Layer.Layer<
             const result: CatalogSoftDeleteResult = { _tag: "NotFound" }
             return [result, state] as const
           }
+          if (
+            input.expectedUpdatedAt !== null &&
+            target.node.updatedAt !== input.expectedUpdatedAt
+          ) {
+            const result: CatalogSoftDeleteResult = {
+              _tag: "Stale",
+              node: target.node,
+            }
+            return [result, state] as const
+          }
 
           const deletedIds = new Set<FileId>([target.node.id])
           let discoveredDescendant = true
@@ -937,12 +1081,18 @@ export const layer = (): Layer.Layer<
           }
 
           const records = new Map(state.records)
+          const changes: Array<ChangeInput> = []
           for (const [key, record] of state.records) {
             if (
               record.deletedAt === null &&
               record.fileSystemId === input.fileSystemId &&
               deletedIds.has(record.node.id)
             ) {
+              if (isVisible(record.node)) {
+                changes.push(
+                  changeAt("node_deleted", record.node, input.actor, input.now),
+                )
+              }
               records.set(key, {
                 ...record,
                 deletedAt: input.now,
@@ -960,9 +1110,34 @@ export const layer = (): Layer.Layer<
             }
           }
           const result: CatalogSoftDeleteResult = { _tag: "Deleted" }
-          return [result, { ...state, records }] as const
+          return [
+            result,
+            appendChanges({ ...state, records }, input.fileSystemId, changes),
+          ] as const
         })
       })
+
+      const listChanges = Effect.fn("InMemoryFileCatalog.listChanges")(
+        function* (
+          fileSystemId: FileSystemId,
+          after: FileChangeSequence | null,
+          limit: PageSize,
+        ) {
+          const state = yield* SynchronizedRef.get(catalogState)
+          const matching = state.changes
+            .filter(
+              (entry) =>
+                entry.fileSystemId === fileSystemId &&
+                (after === null || entry.change.sequence > after),
+            )
+            .map((entry) => entry.change)
+          const page: FileChangePage = {
+            changes: matching.slice(0, limit),
+            more: matching.length > limit,
+          }
+          return page
+        },
+      )
 
       const catalog = FileCatalog.of({
         get,
@@ -970,8 +1145,9 @@ export const layer = (): Layer.Layer<
         createFolder,
         reserveUpload,
         confirmUpload,
-        renameFile,
+        move,
         softDelete,
+        listChanges,
       })
 
       const expirePendingBatch = Effect.fn(
@@ -1191,12 +1367,79 @@ export const layer = (): Layer.Layer<
         )
       })
 
+      const maintenanceDue = Effect.fn(
+        "InMemoryFileReclamationCatalog.maintenanceDue",
+      )(function* () {
+        const state = yield* SynchronizedRef.get(catalogState)
+        const records = [...state.records.values()]
+        return {
+          pendingExpiresAt: minimum(
+            records.map((record) =>
+              record.deletedAt === null && record.node._tag === "PendingFile"
+                ? record.node.pendingExpiresAt
+                : null,
+            ),
+          ),
+          reclaimAfter: minimum(
+            records.map((record) =>
+              record.deletedAt !== null &&
+              record.node._tag !== "Folder" &&
+              record.objectReclaimedAt === null
+                ? record.reclaimAfter
+                : null,
+            ),
+          ),
+          reclaimedDeletedAt: minimum(
+            records.map((record) =>
+              record.deletedAt !== null &&
+              (record.node._tag === "Folder" ||
+                record.objectReclaimedAt !== null)
+                ? record.deletedAt
+                : null,
+            ),
+          ),
+          oldestChangeAt: minimum(
+            state.changes.map((entry) => entry.change.at),
+          ),
+        }
+      })
+
+      const purgeChangesBatch = Effect.fn(
+        "InMemoryFileReclamationCatalog.purgeChangesBatch",
+      )(function* (input: {
+        readonly recordedBefore: TimestampMillis
+        readonly limit: MaintenanceBatchSize
+      }) {
+        return yield* SynchronizedRef.modify<CatalogState, number>(
+          catalogState,
+          (state) => {
+            const purged = new Set(
+              state.changes
+                .filter((entry) => entry.change.at < input.recordedBefore)
+                .slice(0, input.limit)
+                .map((entry) => entry.change.sequence),
+            )
+            return [
+              purged.size,
+              {
+                ...state,
+                changes: state.changes.filter(
+                  (entry) => !purged.has(entry.change.sequence),
+                ),
+              },
+            ] as const
+          },
+        )
+      })
+
       const reclamation = FileReclamationCatalog.of({
         expirePendingBatch,
         listReclaimable,
         completeReclamation,
         deferReclamation,
         purgeReclaimedBatch,
+        maintenanceDue,
+        purgeChangesBatch,
       })
 
       const stat = Effect.fn("InMemoryFileObjects.stat")(function* (
@@ -1220,6 +1463,8 @@ export const layer = (): Layer.Layer<
             _tag: "Upload",
             locator: input.locator,
             maximumBytes: input.maximumBytes,
+            sha256: input.sha256,
+            contentType: input.contentType,
             capability,
           }
           return [
@@ -1280,9 +1525,11 @@ export const layer = (): Layer.Layer<
           }
           const metadata = new Map(state.metadata)
           metadata.delete(locator)
+          const bytes = new Map(state.bytes)
+          bytes.delete(locator)
           return [
             false,
-            { ...state, metadata, deleteAttempts },
+            { ...state, metadata, bytes, deleteAttempts },
           ] as const
         })
         if (shouldFail) {
@@ -1297,6 +1544,37 @@ export const layer = (): Layer.Layer<
         }
       })
 
+      const putObject = Effect.fn("InMemoryFileObjects.put")(function* (input: {
+        readonly locator: FileObjectLocator
+        readonly body: Uint8Array<ArrayBuffer>
+        readonly contentType: FileObjectMetadata["contentType"]
+        readonly sha256: Sha256
+      }) {
+        yield* Ref.update(objectState, (state) => {
+          if (state.metadata.has(input.locator)) return state
+          const metadata = new Map(state.metadata)
+          metadata.set(input.locator, {
+            size: ByteCountSchema.make(input.body.byteLength),
+            contentType: input.contentType,
+            digest: { _tag: "Sha256", value: input.sha256 },
+          })
+          const bytes = new Map(state.bytes)
+          bytes.set(input.locator, input.body.slice())
+          return { ...state, metadata, bytes }
+        })
+      })
+
+      const getObject = Effect.fn("InMemoryFileObjects.get")(function* (
+        locator: FileObjectLocator,
+      ) {
+        const state = yield* Ref.get(objectState)
+        const metadata = state.metadata.get(locator)
+        if (metadata === undefined) return null
+        const bytes =
+          state.bytes.get(locator) ?? new Uint8Array(metadata.size)
+        return new Blob([bytes]).stream()
+      })
+
       const objects = FileObjects.of({
         uploadCapabilityTtlMillis: capabilityLifetimeMillis,
         reclamationGraceMillis: capabilityLifetimeMillis,
@@ -1304,6 +1582,8 @@ export const layer = (): Layer.Layer<
         stat,
         issueUpload,
         issueDownload,
+        put: putObject,
+        get: getObject,
         delete: deleteObject,
       })
 

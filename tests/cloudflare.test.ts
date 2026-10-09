@@ -45,17 +45,19 @@ const uploadClaims = (
   maximumBytes = 4,
   expiresAt = now + 60_000,
 ): FileCapabilityClaims => ({
-  version: 1,
+  version: 2,
   operation: "put",
   locator,
   expiresAt: TimestampMillisSchema.make(expiresAt),
   maximumBytes: ByteCountSchema.make(maximumBytes),
+  sha256: null,
+  contentType: null,
 })
 
 const downloadClaims = (
   expiresAt = now + 60_000,
 ): FileCapabilityClaims => ({
-  version: 1,
+  version: 2,
   operation: "get",
   locator,
   expiresAt: TimestampMillisSchema.make(expiresAt),
@@ -598,6 +600,8 @@ describe("Cloudflare FileObjects adapter", () => {
         locator: objectLocator,
         maximumBytes: ByteCountSchema.make(12),
         expiresAt,
+        sha256: null,
+        contentType: null,
       }),
     )
     const token = new URL(capability.url).pathname.slice("/o/".length)

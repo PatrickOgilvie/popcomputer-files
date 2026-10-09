@@ -3,6 +3,7 @@ import { FileIdSchema } from "./file.js"
 
 /** Stable public error codes returned by the standard HTTP control plane. */
 export const FilesRejectionCodeSchema = Schema.Literals([
+  "checksum_mismatch",
   "file_not_found",
   "file_store_unavailable",
   "file_too_large",
@@ -17,10 +18,13 @@ export const FilesRejectionCodeSchema = Schema.Literals([
   "invalid_file_name",
   "invalid_file_node",
   "invalid_path",
+  "invalid_sha256",
   "invalid_size",
+  "move_into_itself",
   "name_conflict",
   "not_a_file",
   "quota_exceeded",
+  "stale_file",
   "unauthorized",
   "upload_already_confirmed",
   "upload_unavailable",
@@ -41,7 +45,9 @@ export class InvalidFileInput extends Schema.TaggedError<InvalidFileInput>()(
       "invalid_file_id",
       "invalid_file_name",
       "invalid_path",
+      "invalid_sha256",
       "invalid_size",
+      "move_into_itself",
     ]),
   },
 ) {}
@@ -58,9 +64,21 @@ export class FolderRequired extends Schema.TaggedError<FolderRequired>()(
   { fileId: FileIdSchema },
 ) {}
 
-/** Folder rename is outside this version's supported lifecycle. */
+/** An operation on bytes was given a folder. */
 export class FileRequired extends Schema.TaggedError<FileRequired>()(
   "FileRequired",
+  { fileId: FileIdSchema },
+) {}
+
+/** The node changed after the instant the caller expected. */
+export class StaleFileNode extends Schema.TaggedError<StaleFileNode>()(
+  "StaleFileNode",
+  { fileId: FileIdSchema },
+) {}
+
+/** Stored bytes do not have the SHA-256 the upload declared. */
+export class UploadChecksumMismatch extends Schema.TaggedError<UploadChecksumMismatch>()(
+  "UploadChecksumMismatch",
   { fileId: FileIdSchema },
 ) {}
 

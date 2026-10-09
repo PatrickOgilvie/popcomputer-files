@@ -16,7 +16,9 @@ import {
   IdempotencyConflict,
   InvalidFileInput,
   InvalidStoredFile,
+  StaleFileNode,
   UploadAlreadyConfirmed,
+  UploadChecksumMismatch,
   UploadNoLongerAvailable,
   UploadNotFound,
 } from "./errors.js"
@@ -43,7 +45,8 @@ import {
   FileNodeResponseDtoSchema,
   FilePageDtoSchema,
   FolderIdempotencyKeySchema,
-  RenameFileBodySchema,
+  IsoTimestampSchema,
+  MoveNodeBodySchema,
   RequestUploadBodySchema,
   UploadIdempotencyKeySchema,
   UploadTicketDtoSchema,
@@ -53,6 +56,7 @@ import {
   fileNodeToDto,
   filePageFromDto,
   filePageToDto,
+  timestampFromIso,
   uploadTicketFromDto,
   uploadTicketToDto,
   type DownloadTicketDto,
@@ -103,6 +107,8 @@ type FilesHttpError =
   | FileNameConflict
   | IdempotencyConflict
   | FolderNoLongerAvailable
+  | StaleFileNode
+  | UploadChecksumMismatch
   | UploadAlreadyConfirmed
   | UploadNoLongerAvailable
   | UploadNotFound
@@ -325,6 +331,16 @@ const toErrorResponse = (error: FilesHttpError): Response => {
         { error: { code: "idempotency_conflict", message: "The idempotency key was used for another command." } },
         409,
       )
+    case "StaleFileNode":
+      return jsonResponse(
+        { error: { code: "stale_file", message: "The file changed since it was read." } },
+        409,
+      )
+    case "UploadChecksumMismatch":
+      return jsonResponse(
+        { error: { code: "checksum_mismatch", message: "Uploaded bytes do not match the declared SHA-256." } },
+        409,
+      )
     case "FolderNoLongerAvailable":
       return jsonResponse(
         { error: { code: "folder_unavailable", message: "The folder is no longer available." } },
@@ -494,6 +510,8 @@ export const makeFilesHttpHandler = (
           name,
           size: body.size,
           idempotencyKey,
+          sha256: body.sha256 ?? null,
+          contentType: body.contentType ?? null,
         })
         return jsonResponse(uploadTicketToDto(ticket), 201)
       }
@@ -523,16 +541,26 @@ export const makeFilesHttpHandler = (
         const fileId = yield* parseRouteFileId(route[0] ?? "")
         const body = yield* readJson(
           request,
-          RenameFileBodySchema,
+          MoveNodeBodySchema,
           maximumBodyBytes,
         )
         const name = yield* parseFileName(body.name).pipe(
           Effect.mapError(() => invalidInput("invalid_file_name")),
         )
-        const node = yield* options.fileSystem.renameFile({
+        const parentId =
+          body.parentId === undefined
+            ? (yield* options.fileSystem.getNode({ ...authorized, fileId }))
+                .parentId
+            : body.parentId
+        const node = yield* options.fileSystem.move({
           ...authorized,
           fileId,
+          parentId,
           name,
+          expectedUpdatedAt:
+            body.expectedUpdatedAt === undefined
+              ? null
+              : timestampFromIso(body.expectedUpdatedAt),
         })
         return jsonResponse({ node: fileNodeToDto(node) })
       }
@@ -540,7 +568,22 @@ export const makeFilesHttpHandler = (
       if (route.length === 1 && request.method === "DELETE") {
         const authorized = yield* options.authorizer.authorize(request, "delete")
         const fileId = yield* parseRouteFileId(route[0] ?? "")
-        yield* options.fileSystem.softDelete({ ...authorized, fileId })
+        const rawExpected = url.searchParams.get("expectedUpdatedAt")
+        const expectedUpdatedAt =
+          rawExpected === null
+            ? null
+            : timestampFromIso(
+                yield* decodeString(
+                  IsoTimestampSchema,
+                  rawExpected,
+                  "invalid_body",
+                ),
+              )
+        yield* options.fileSystem.softDelete({
+          ...authorized,
+          fileId,
+          expectedUpdatedAt,
+        })
         return new Response(null, { status: 204 })
       }
 

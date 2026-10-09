@@ -109,6 +109,17 @@ const migration = readFileSync(new URL(migrationUrl), "utf8")
 if (!migration.includes("CREATE TABLE IF NOT EXISTS popcomputer_files")) {
   throw new Error("Published D1 migration failed")
 }
+const changesMigration = readFileSync(
+  new URL(
+    import.meta.resolve(
+      "@popcomputer/files/migrations/d1/0002_file_digests_and_changes.sql",
+    ),
+  ),
+  "utf8",
+)
+if (!changesMigration.includes("popcomputer_file_changes")) {
+  throw new Error("Published change-log migration failed")
+}
 for (const requiredFile of [
   "README.md",
   "SECURITY.md",

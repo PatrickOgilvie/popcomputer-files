@@ -15,18 +15,22 @@ import {
   CapabilityUrlSchema,
   FileContentTypeSchema,
   FileNameSchema,
+  Sha256Schema,
   TimestampMillisSchema,
+  type ContentDigest,
   type FileName,
   type FileContentType,
 } from "../file.js"
 
-const capabilityTokenVersion = "v1"
+const capabilityTokenVersion = "v2"
 const maximumCapabilityTokenLength = 4096
 const defaultUploadCapabilityTtlMillis = 60_000
 const defaultDownloadCapabilityTtlMillis = 300_000
 const defaultMaximumUploadDurationMillis = 300_000
 const defaultClockSkewAllowanceMillis = 30_000
-const objectRoutePrefix = "/o/"
+const defaultCapabilityPath = "/o/"
+const defaultKeyPrefix = "files/v1/"
+const maximumKeyPrefixLength = 512
 const objectCorsMethodsHeader = "GET, PUT, OPTIONS"
 const objectCorsRequestHeadersHeader = "Content-Type"
 const objectCorsExposeHeadersHeader =
@@ -49,12 +53,18 @@ export interface R2HttpMetadataPort {
   readonly contentType?: string
 }
 
+/** Checksums R2 kept because the writer supplied them. */
+export interface R2ChecksumsPort {
+  readonly sha256?: ArrayBuffer
+}
+
 /** Object metadata returned by the structural R2 port. */
 export interface R2ObjectPort {
   readonly size: number
   readonly etag: string
   readonly httpEtag?: string
   readonly httpMetadata?: R2HttpMetadataPort
+  readonly checksums?: R2ChecksumsPort
 }
 
 /** Downloadable object returned by the structural R2 port. */
@@ -82,6 +92,8 @@ export interface R2BucketPort {
     options: {
       readonly httpMetadata: R2HttpMetadataPort
       readonly onlyIf: R2PutConditionPort
+      /** Hex SHA-256 R2 verifies before storing, and keeps for `head`. */
+      readonly sha256?: string
     },
   ) => PromiseLike<R2PutResultPort | null>
   /** Idempotently remove one object; deleting an absent key succeeds. */
@@ -91,13 +103,17 @@ export interface R2BucketPort {
 /** Operation authorized by one file data-plane capability. */
 export type FileCapabilityOperation = "get" | "put"
 
-/** Runtime schema for a version-one bounded upload capability. */
+/** Runtime schema for a version-two bounded upload capability. */
 export const UploadFileCapabilityClaimsSchema = Schema.Struct({
-  version: Schema.Literal(1),
+  version: Schema.Literal(2),
   operation: Schema.Literal("put"),
   locator: FileObjectLocatorSchema,
   expiresAt: TimestampMillisSchema,
   maximumBytes: ByteCountSchema,
+  /** When set, R2 rejects bytes with any other digest. */
+  sha256: Schema.NullOr(Sha256Schema),
+  /** When set, stored as the object's media type instead of the request's. */
+  contentType: Schema.NullOr(FileContentTypeSchema),
 })
 
 /** Signed claim granting one bounded direct upload. */
@@ -105,9 +121,9 @@ export type UploadFileCapabilityClaims = Schema.Schema.Type<
   typeof UploadFileCapabilityClaimsSchema
 >
 
-/** Runtime schema for a version-one attachment download capability. */
+/** Runtime schema for a version-two attachment download capability. */
 export const DownloadFileCapabilityClaimsSchema = Schema.Struct({
-  version: Schema.Literal(1),
+  version: Schema.Literal(2),
   operation: Schema.Literal("get"),
   locator: FileObjectLocatorSchema,
   expiresAt: TimestampMillisSchema,
@@ -119,13 +135,13 @@ export type DownloadFileCapabilityClaims = Schema.Schema.Type<
   typeof DownloadFileCapabilityClaimsSchema
 >
 
-/** Runtime schema for the strict version-one capability union. */
+/** Runtime schema for the strict version-two capability union. */
 export const FileCapabilityClaimsSchema = Schema.Union([
   UploadFileCapabilityClaimsSchema,
   DownloadFileCapabilityClaimsSchema,
 ])
 
-/** Strict version-one file capability claim union. */
+/** Strict version-two file capability claim union. */
 export type FileCapabilityClaims = Schema.Schema.Type<
   typeof FileCapabilityClaimsSchema
 >
@@ -158,6 +174,13 @@ export interface CloudflareFileObjectsOptions {
   readonly capabilityOrigin: URL
   readonly signingSecret: Redacted.Redacted<string>
   readonly capabilityPolicy: CloudflareFileCapabilityPolicy
+  /**
+   * Object keys are `{keyPrefix}{uuid}`. A host that shares a bucket gives
+   * each filesystem its own prefix. Defaults to `files/v1/`.
+   */
+  readonly keyPrefix?: string
+  /** Path under the origin where the data plane is mounted. Defaults to `/o/`. */
+  readonly capabilityPath?: string
   /** Explicit development escape hatch for an HTTP capability origin. */
   readonly allowInsecureHttp?: boolean
 }
@@ -167,6 +190,8 @@ export interface CloudflareFileDataPlaneOptions {
   readonly bucket: R2BucketPort
   readonly signingSecret: Redacted.Redacted<string>
   readonly capabilityPolicy: CloudflareFileCapabilityPolicy
+  /** Path the handler is mounted at; must match the issuer's. Defaults to `/o/`. */
+  readonly capabilityPath?: string
   readonly allowedOrigins?: ReadonlyArray<string>
   readonly now?: () => number
   /** Explicit development escape hatch for cleartext data-plane requests. */
@@ -404,13 +429,15 @@ const contentTypeOrNull = (
 ): FileContentType | null =>
   value !== undefined && isFileContentType(value) ? value : null
 
-const opaqueEtagOrNull = (
-  value: string,
-): FileObjectMetadata["digest"] => {
-  if (value.length === 0 || value.length > 512) {
+const digestOf = (object: R2ObjectPort): ContentDigest | null => {
+  const sha256 = object.checksums?.sha256
+  if (sha256 !== undefined && sha256.byteLength === 32) {
+    return { _tag: "Sha256", value: hexOf(sha256) }
+  }
+  if (object.etag.length === 0 || object.etag.length > 512) {
     return null
   }
-  return { _tag: "OpaqueEtag", value }
+  return { _tag: "OpaqueEtag", value: object.etag }
 }
 
 const metadataFromObject = (
@@ -427,7 +454,7 @@ const metadataFromObject = (
   return Effect.succeed({
     size: object.size,
     contentType: contentTypeOrNull(object.httpMetadata?.contentType),
-    digest: opaqueEtagOrNull(object.etag),
+    digest: digestOf(object),
   })
 }
 
@@ -458,6 +485,38 @@ const normalizedCapabilityOrigin = (
   }
   return new URL(origin.origin)
 }
+
+const checkedCapabilityPath = (value: string | undefined): string => {
+  const path = value ?? defaultCapabilityPath
+  if (!/^\/(?:[A-Za-z0-9._~-]+\/)*$/u.test(path) || path.includes("/../")) {
+    throw new Error(
+      "The file capability path must start and end with '/' and use URL-safe segments.",
+    )
+  }
+  return path
+}
+
+const checkedKeyPrefix = (value: string | undefined): string => {
+  const prefix = value ?? defaultKeyPrefix
+  if (
+    prefix.length === 0 ||
+    prefix.length > maximumKeyPrefixLength ||
+    prefix.startsWith("/") ||
+    !prefix.endsWith("/") ||
+    prefix.split("/").some((segment) => segment === "." || segment === "..") ||
+    !/^[A-Za-z0-9._~/-]+$/u.test(prefix)
+  ) {
+    throw new Error(
+      "The file object key prefix must be a relative, '/'-terminated R2 key prefix.",
+    )
+  }
+  return prefix
+}
+
+const hexOf = (buffer: ArrayBuffer): string =>
+  Array.from(new Uint8Array(buffer), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("")
 
 const checkedPositiveDuration = (
   name: string,
@@ -546,7 +605,7 @@ const issueCapability = (
     FileCapabilityUnavailable
   >,
   operation: "issue_upload" | "issue_download",
-  capabilityOrigin: URL,
+  capabilityBase: URL,
   signingSecret: Redacted.Redacted<string>,
 ) =>
   Clock.currentTimeMillis.pipe(
@@ -563,8 +622,7 @@ const issueCapability = (
               mintFileCapability(claims, signingSecret, now).pipe(
                 Effect.map((token) => ({
                   url: CapabilityUrlSchema.make(
-                    new URL(`${objectRoutePrefix}${token}`, capabilityOrigin)
-                      .href,
+                    new URL(token, capabilityBase).href,
                   ),
                   expiresAt: claims.expiresAt,
                 })),
@@ -582,19 +640,21 @@ export const makeCloudflareFileObjects = (
   options: CloudflareFileObjectsOptions,
 ): FileObjectsService => {
   assertStrongSigningSecret(options.signingSecret)
-  const capabilityOrigin = normalizedCapabilityOrigin(
-    options.capabilityOrigin,
-    options.allowInsecureHttp === true,
+  const capabilityBase = new URL(
+    checkedCapabilityPath(options.capabilityPath),
+    normalizedCapabilityOrigin(
+      options.capabilityOrigin,
+      options.allowInsecureHttp === true,
+    ),
   )
+  const keyPrefix = checkedKeyPrefix(options.keyPrefix)
   const policy = options.capabilityPolicy
 
   return FileObjects.of({
     uploadCapabilityTtlMillis: policy.uploadCapabilityTtlMillis,
     reclamationGraceMillis: policy.reclamationGraceMillis,
     locationFor: () =>
-      FileObjectLocatorSchema.make(
-        `files/v1/${crypto.randomUUID()}`,
-      ),
+      FileObjectLocatorSchema.make(`${keyPrefix}${crypto.randomUUID()}`),
     stat: (locator) =>
       Effect.tryPromise({
         try: () => options.bucket.head(locator),
@@ -607,7 +667,7 @@ export const makeCloudflareFileObjects = (
             : metadataFromObject(object),
         ),
       ),
-    issueUpload: ({ locator, maximumBytes, expiresAt }) =>
+    issueUpload: ({ locator, maximumBytes, expiresAt, sha256, contentType }) =>
       issueCapability(
         (now) =>
           expiresAt <= now ||
@@ -621,14 +681,16 @@ export const makeCloudflareFileObjects = (
                 }),
               )
             : Effect.succeed({
-                version: 1,
+                version: 2,
                 operation: "put",
                 locator,
                 expiresAt,
                 maximumBytes,
+                sha256,
+                contentType,
               }),
         "issue_upload",
-        capabilityOrigin,
+        capabilityBase,
         options.signingSecret,
       ),
     issueDownload: ({ locator, fileName }) =>
@@ -646,7 +708,7 @@ export const makeCloudflareFileObjects = (
             )
           }
           return Effect.succeed({
-            version: 1,
+            version: 2,
             operation: "get",
             locator,
             expiresAt: TimestampMillisSchema.make(expiry),
@@ -654,9 +716,27 @@ export const makeCloudflareFileObjects = (
           })
         },
         "issue_download",
-        capabilityOrigin,
+        capabilityBase,
         options.signingSecret,
       ),
+    put: ({ locator, body, contentType, sha256 }) =>
+      Effect.tryPromise({
+        try: () =>
+          options.bucket.put(locator, new Blob([body]).stream(), {
+            httpMetadata:
+              contentType === null ? {} : { contentType },
+            onlyIf: { etagDoesNotMatch: "*" },
+            sha256,
+          }),
+        catch: (cause) =>
+          new FileObjectStoreUnavailable({ operation: "put", cause }),
+      }).pipe(Effect.asVoid),
+    get: (locator) =>
+      Effect.tryPromise({
+        try: () => options.bucket.get(locator),
+        catch: (cause) =>
+          new FileObjectStoreUnavailable({ operation: "get", cause }),
+      }).pipe(Effect.map((object) => object?.body ?? null)),
     delete: (locator) =>
       Effect.tryPromise({
         try: () => options.bucket.delete(locator),
@@ -907,12 +987,15 @@ const preflightResponse = (
   return new Response(null, { status: 204, headers })
 }
 
-const capabilityTokenFromRequest = (request: Request): string | null => {
+const capabilityTokenFromRequest = (
+  request: Request,
+  capabilityPath: string,
+): string | null => {
   const path = new URL(request.url).pathname
-  if (!path.startsWith(objectRoutePrefix)) {
+  if (!path.startsWith(capabilityPath)) {
     return null
   }
-  const token = path.slice(objectRoutePrefix.length)
+  const token = path.slice(capabilityPath.length)
   return token.length > 0 && !token.includes("/") ? token : null
 }
 
@@ -967,10 +1050,18 @@ const uploadContentType = (request: Request): FileContentType =>
   contentTypeOrNull(request.headers.get("content-type") ?? undefined) ??
   FileContentTypeSchema.make("application/octet-stream")
 
+// R2 reports a digest mismatch only through its error text (code 10037,
+// "BadDigest"); nothing was stored, so the client must not retry as if the
+// store were unavailable.
+const isDigestMismatchError = (cause: unknown): boolean =>
+  cause instanceof Error &&
+  /\b10037\b|BadDigest|checksum|digest/iu.test(cause.message)
+
 const uploadFailureStatus = (
   request: Request,
   deadline: UploadDeadline,
   cause: unknown,
+  expectsDigest: boolean,
 ): number =>
   request.signal.aborted
     ? 499
@@ -978,7 +1069,9 @@ const uploadFailureStatus = (
       ? 408
       : isCapacityExceededError(cause)
         ? 413
-        : 503
+        : expectsDigest && isDigestMismatchError(cause)
+          ? 400
+          : 503
 
 const etagHeader = (object: R2ObjectPort): string | null => {
   if (
@@ -1022,6 +1115,7 @@ const handleUpload = async (
   if (gate.claims.operation !== "put") {
     return emptyResponse(403, cors)
   }
+  const expectsDigest = gate.claims.sha256 !== null
 
   const declared = declaredContentLength(request)
   if (declared === "invalid") {
@@ -1073,9 +1167,17 @@ const handleUpload = async (
     const storing = Promise.resolve()
       .then(() => {
         request.signal.throwIfAborted()
-        return options.bucket.put(gate.claims.locator, prepared.body, {
-          httpMetadata: { contentType: uploadContentType(request) },
+        const claims = gate.claims
+        const contentType =
+          claims.operation === "put" && claims.contentType !== null
+            ? claims.contentType
+            : uploadContentType(request)
+        return options.bucket.put(claims.locator, prepared.body, {
+          httpMetadata: { contentType },
           onlyIf: { etagDoesNotMatch: "*" },
+          ...(claims.operation === "put" && claims.sha256 !== null
+            ? { sha256: claims.sha256 }
+            : {}),
         })
       })
       .then(
@@ -1106,7 +1208,7 @@ const handleUpload = async (
           ? transferred.cause
           : first.cause
       return emptyResponse(
-        uploadFailureStatus(request, deadline, classifiedCause),
+        uploadFailureStatus(request, deadline, classifiedCause, expectsDigest),
         cors,
       )
     }
@@ -1123,14 +1225,19 @@ const handleUpload = async (
     const transferred = await prepared.transfer
     if (transferred._tag === "Failed") {
       return emptyResponse(
-        uploadFailureStatus(request, deadline, transferred.cause),
+        uploadFailureStatus(
+          request,
+          deadline,
+          transferred.cause,
+          expectsDigest,
+        ),
         cors,
       )
     }
     return emptyResponse(204, cors)
   } catch (cause: unknown) {
     return emptyResponse(
-      uploadFailureStatus(request, deadline, cause),
+      uploadFailureStatus(request, deadline, cause, expectsDigest),
       cors,
     )
   } finally {
@@ -1201,6 +1308,7 @@ export const makeCloudflareFileDataPlaneHandler = (
   options: CloudflareFileDataPlaneOptions,
 ): CloudflareFileDataPlaneHandler => {
   assertStrongSigningSecret(options.signingSecret)
+  const capabilityPath = checkedCapabilityPath(options.capabilityPath)
   const allowedOrigins = new Set<string>()
   for (const configured of options.allowedOrigins ?? []) {
     const origin = parseOrigin(configured)
@@ -1218,7 +1326,7 @@ export const makeCloudflareFileDataPlaneHandler = (
     ) {
       return emptyResponse(400, { _tag: "Absent" })
     }
-    const token = capabilityTokenFromRequest(request)
+    const token = capabilityTokenFromRequest(request, capabilityPath)
     if (token === null) {
       return emptyResponse(404, { _tag: "Absent" })
     }

@@ -13,12 +13,12 @@ import {
 import { drizzle } from "drizzle-orm/sqlite-proxy"
 import {
   Effect,
-  Encoding,
   Layer,
   Option,
   Result,
   Schema,
 } from "effect"
+import { Base64Url } from "effect/encoding"
 import {
   FileCatalog,
   FileObjectLocatorSchema,
@@ -27,8 +27,12 @@ import {
   type CatalogCreateFolderInput,
   type CatalogCreateFolderResult,
   type CatalogFilePage,
+  type CatalogMoveInput,
+  type CatalogMoveResult,
   type CatalogReserveUploadInput,
   type CatalogReserveUploadResult,
+  type CatalogSoftDeleteInput,
+  type CatalogSoftDeleteResult,
   type FileCatalogService,
   type FileReclamationCatalogService,
   type StoredFileNode,
@@ -41,6 +45,7 @@ import {
   ByteCountSchema,
   FileActorIdSchema,
   FileActorKindSchema,
+  FileChangeSchema,
   FileContentTypeSchema,
   FileIdSchema,
   FileNameSchema,
@@ -50,7 +55,7 @@ import {
   RelativePathSchema,
   TimestampMillisSchema,
   childPath,
-  replacePathLeaf,
+  type FileChangePage,
   type FileId,
   type FileListTarget,
   type FileSystemId,
@@ -58,9 +63,11 @@ import {
   type RelativePath,
 } from "../file.js"
 import {
+  d1FileChanges,
   d1FileFolderRequests,
   d1Files,
   d1FileUploadRequests,
+  type D1FileChangeRow,
   type D1FileFolderRequestRow,
   type D1FileRow,
   type D1FileUploadRequestRow,
@@ -140,6 +147,7 @@ const persistedLiveBase = {
 
 const PersistedFolderSchema = Schema.Struct({
   ...persistedLiveBase,
+  expectedSha256: Schema.Null,
   kind: Schema.Literal("folder"),
   status: Schema.Literal("ready"),
   locator: Schema.Null,
@@ -153,6 +161,7 @@ const PersistedFolderSchema = Schema.Struct({
 
 const PersistedPendingFileSchema = Schema.Struct({
   ...persistedLiveBase,
+  expectedSha256: Schema.NullOr(sha256Schema),
   kind: Schema.Literal("file"),
   status: Schema.Literal("pending"),
   locator: FileObjectLocatorSchema,
@@ -166,6 +175,7 @@ const PersistedPendingFileSchema = Schema.Struct({
 
 const readyFileBase = {
   ...persistedLiveBase,
+  expectedSha256: Schema.NullOr(sha256Schema),
   kind: Schema.Literal("file"),
   status: Schema.Literal("ready"),
   locator: FileObjectLocatorSchema,
@@ -222,6 +232,7 @@ const PersistedUploadRequestSchema = Schema.Struct({
   requestedName: FileNameSchema,
   requestedMaximumBytes: ByteCountSchema,
   createdAt: TimestampMillisSchema,
+  requestedSha256: Schema.NullOr(sha256Schema),
 })
 type PersistedUploadRequest = Schema.Schema.Type<
   typeof PersistedUploadRequestSchema
@@ -261,6 +272,7 @@ const ReturningFileRowSchema = Schema.Tuple([
   Schema.Null,
   Schema.Null,
   Schema.Null,
+  Schema.NullOr(sha256Schema),
 ])
 
 const ReclamationCandidateRowsSchema = Schema.Array(
@@ -319,13 +331,14 @@ const returningColumns = `
   deleted_actor_kind,
   deleted_actor_id,
   reclaim_after,
-  object_reclaimed_at
+  object_reclaimed_at,
+  expected_sha256
 `
 
 const insertNodeSql = `
   INSERT INTO popcomputer_files (${returningColumns})
   SELECT
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
   WHERE ? IS NULL OR EXISTS (
     SELECT 1
     FROM popcomputer_files AS parent
@@ -340,7 +353,7 @@ const insertNodeSql = `
 
 const insertCommandNodeSql = `
   INSERT INTO popcomputer_files (${returningColumns})
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 const insertFolderRequestSql = `
@@ -362,9 +375,10 @@ const insertUploadRequestSql = `
     requested_parent_id,
     requested_name,
     requested_maximum_bytes,
-    created_at
+    created_at,
+    requested_sha256
   )
-  SELECT ?, ?, ?, ?, ?, ?, ?
+  SELECT ?, ?, ?, ?, ?, ?, ?, ?
   WHERE EXISTS (
     SELECT 1
     FROM popcomputer_files AS file
@@ -401,7 +415,7 @@ const confirmUploadSql = `
       digest_value = ?,
       updated_actor_kind = ?,
       updated_actor_id = ?,
-      updated_at = ?
+      updated_at = max(?, updated_at + 1)
   WHERE file_system_id = ?
     AND id = ?
     AND deleted_at IS NULL
@@ -419,40 +433,121 @@ const confirmUploadSql = `
   RETURNING ${returningColumns}
 `
 
-const renameFileSql = `
+// Moves one node and its whole subtree in one statement. The guard is
+// materialized before any row changes, so every row is judged against the
+// tree as it was: the source still at its observed path and instant, the
+// destination a live folder at its observed path, no live node at the new
+// path or name, and no descendant pushed past 1024 code points or 32 segments.
+const moveSubtreeSql = `
+  WITH intent AS MATERIALIZED (
+    SELECT
+      ? AS file_system_id,
+      ? AS id,
+      ? AS old_path,
+      ? AS observed_updated_at,
+      ? AS parent_id,
+      ? AS parent_path,
+      ? AS name,
+      ? AS new_path
+  ), guard AS MATERIALIZED (
+    SELECT 1 AS ok
+    FROM intent
+    WHERE EXISTS (
+        SELECT 1
+        FROM popcomputer_files AS source
+        WHERE source.file_system_id = intent.file_system_id
+          AND source.id = intent.id
+          AND source.deleted_at IS NULL
+          AND source.path = intent.old_path
+          AND source.updated_at = intent.observed_updated_at
+      )
+      AND (
+        intent.parent_id IS NULL
+        OR EXISTS (
+          SELECT 1
+          FROM popcomputer_files AS parent
+          WHERE parent.file_system_id = intent.file_system_id
+            AND parent.id = intent.parent_id
+            AND parent.deleted_at IS NULL
+            AND parent.kind = 'folder'
+            AND parent.path = intent.parent_path
+        )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM popcomputer_files AS conflict
+        WHERE conflict.file_system_id = intent.file_system_id
+          AND conflict.deleted_at IS NULL
+          AND conflict.id <> intent.id
+          AND (
+            conflict.path = intent.new_path
+            OR (
+              conflict.parent_id IS intent.parent_id
+              AND conflict.name = intent.name
+            )
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM popcomputer_files AS descendant
+        WHERE descendant.file_system_id = intent.file_system_id
+          AND descendant.deleted_at IS NULL
+          AND substr(descendant.path, 1, length(intent.old_path) + 1)
+            = intent.old_path || '/'
+          AND (
+            length(intent.new_path) + length(descendant.path)
+              - length(intent.old_path) > 1024
+            OR (
+              length(intent.new_path)
+                - length(replace(intent.new_path, '/', ''))
+              + length(descendant.path)
+                - length(replace(descendant.path, '/', ''))
+              - length(intent.old_path)
+                + length(replace(intent.old_path, '/', ''))
+            ) >= 32
+          )
+      )
+  )
   UPDATE popcomputer_files
-  SET name = ?,
-      path = ?,
+  SET parent_id = CASE
+        WHEN id = (SELECT id FROM intent) THEN (SELECT parent_id FROM intent)
+        ELSE parent_id
+      END,
+      name = CASE
+        WHEN id = (SELECT id FROM intent) THEN (SELECT name FROM intent)
+        ELSE name
+      END,
+      path = (SELECT new_path FROM intent)
+        || substr(path, length((SELECT old_path FROM intent)) + 1),
       updated_actor_kind = ?,
       updated_actor_id = ?,
-      updated_at = ?
-  WHERE file_system_id = ?
-    AND id = ?
+      updated_at = max(?, updated_at + 1)
+  WHERE EXISTS (SELECT 1 FROM guard)
+    AND file_system_id = (SELECT file_system_id FROM intent)
     AND deleted_at IS NULL
-    AND kind = 'file'
-    AND NOT EXISTS (
-      SELECT 1
-      FROM popcomputer_files AS conflict
-      WHERE conflict.file_system_id = ?
-        AND conflict.deleted_at IS NULL
-        AND conflict.id <> ?
-        AND (
-          conflict.path = ?
-          OR (
-            conflict.parent_id IS popcomputer_files.parent_id
-            AND conflict.name = ?
-          )
-        )
+    AND (
+      id = (SELECT id FROM intent)
+      OR substr(path, 1, length((SELECT old_path FROM intent)) + 1)
+        = (SELECT old_path FROM intent) || '/'
     )
-  RETURNING ${returningColumns}
 `
 
+// Deletes one node and its subtree, found from the node's id at the moment
+// of deletion rather than from a path read earlier.
 const softDeleteSubtreeSql = `
+  WITH root AS MATERIALIZED (
+    SELECT path
+    FROM popcomputer_files
+    WHERE file_system_id = ?
+      AND id = ?
+      AND deleted_at IS NULL
+      AND (? IS NULL OR updated_at = ?)
+  )
   UPDATE popcomputer_files
   SET deleted_at = ?,
       deleted_actor_kind = ?,
       deleted_actor_id = ?,
-      updated_at = ?,
+      updated_at = max(?, updated_at),
       updated_actor_kind = ?,
       updated_actor_id = ?,
       reclaim_after = CASE
@@ -462,7 +557,12 @@ const softDeleteSubtreeSql = `
       END
   WHERE file_system_id = ?
     AND deleted_at IS NULL
-    AND (path = ? OR substr(path, 1, length(?)) = ?)
+    AND EXISTS (SELECT 1 FROM root)
+    AND (
+      id = ?
+      OR substr(path, 1, length((SELECT path FROM root)) + 1)
+        = (SELECT path FROM root) || '/'
+    )
 `
 
 const expirePendingBatchSql = `
@@ -546,6 +646,49 @@ const purgeReclaimedBatchSql = `
   )
 `
 
+const maintenanceDueSql = `
+  SELECT
+    (
+      SELECT min(pending_expires_at)
+      FROM popcomputer_files
+      WHERE deleted_at IS NULL AND kind = 'file' AND status = 'pending'
+    ),
+    (
+      SELECT min(reclaim_after)
+      FROM popcomputer_files
+      WHERE deleted_at IS NOT NULL
+        AND locator IS NOT NULL
+        AND object_reclaimed_at IS NULL
+    ),
+    (
+      SELECT min(deleted_at)
+      FROM popcomputer_files
+      WHERE deleted_at IS NOT NULL
+        AND (locator IS NULL OR object_reclaimed_at IS NOT NULL)
+    ),
+    (SELECT min(recorded_at) FROM popcomputer_file_changes)
+`
+
+const purgeChangesBatchSql = `
+  DELETE FROM popcomputer_file_changes
+  WHERE sequence IN (
+    SELECT sequence
+    FROM popcomputer_file_changes
+    WHERE recorded_at < ?
+    ORDER BY sequence
+    LIMIT ?
+  )
+`
+
+const MaintenanceDueRowsSchema = Schema.Array(
+  Schema.Tuple([
+    Schema.NullOr(TimestampMillisSchema),
+    Schema.NullOr(TimestampMillisSchema),
+    Schema.NullOr(TimestampMillisSchema),
+    Schema.NullOr(TimestampMillisSchema),
+  ]),
+)
+
 const unavailable = (
   operation: string,
   cause: unknown,
@@ -608,6 +751,7 @@ const toStoredNode = (
             locator: row.locator,
             maximumBytes: row.maximumBytes,
             pendingExpiresAt: row.pendingExpiresAt,
+            expectedSha256: row.expectedSha256,
           }
         : {
             _tag: "ReadyFile",
@@ -665,6 +809,7 @@ const decodeReturningRow = (
         deletedActorId: row[22],
         reclaimAfter: row[23],
         objectReclaimedAt: row[24],
+        expectedSha256: row[25],
       }),
     ),
     Effect.flatMap(toStoredNode),
@@ -676,7 +821,7 @@ const encodeCursor = (
   node: StoredFileNode,
 ): PageCursor =>
   PageCursorSchema.make(
-    Encoding.encodeBase64Url(
+    Base64Url.encode(
       JSON.stringify({
         version: 1,
         fileSystemId,
@@ -689,7 +834,7 @@ const encodeCursor = (
   )
 
 const decodeCursor = (cursor: PageCursor): CursorPayload | null => {
-  const text = Result.getOrNull(Encoding.decodeBase64UrlString(cursor))
+  const text = Result.getOrNull(Base64Url.decodeString(cursor))
   if (text === null) return null
   return Option.getOrNull(
     Schema.decodeUnknownOption(CursorPayloadFromStringSchema)(text),
@@ -1007,7 +1152,8 @@ const makeD1Adapters = (database: D1FilesDatabase): D1Adapters => {
   ): boolean =>
     request.requestedParentId === input.parentId &&
     request.requestedName === input.name &&
-    request.requestedMaximumBytes === input.maximumBytes
+    request.requestedMaximumBytes === input.maximumBytes &&
+    request.requestedSha256 === input.expectedSha256
 
   const replayResult = (
     request: PersistedUploadRequest,
@@ -1196,6 +1342,7 @@ const makeD1Adapters = (database: D1FilesDatabase): D1Adapters => {
       null,
       null,
       null,
+      null,
     ]
     const nodeStatement = database
       .prepare(insertCommandNodeSql)
@@ -1304,6 +1451,7 @@ const makeD1Adapters = (database: D1FilesDatabase): D1Adapters => {
       null,
       null,
       null,
+      input.expectedSha256,
     ]
     const nodeStatement = database.prepare(insertNodeSql).bind(
       ...nodeValues,
@@ -1319,6 +1467,7 @@ const makeD1Adapters = (database: D1FilesDatabase): D1Adapters => {
       input.name,
       input.maximumBytes,
       input.now,
+      input.expectedSha256,
       input.fileSystemId,
       input.id,
       input.locator,
@@ -1426,73 +1575,138 @@ const makeD1Adapters = (database: D1FilesDatabase): D1Adapters => {
     return { _tag: "QuotaExceeded" }
   })
 
-  const renameFile: FileCatalogService["renameFile"] = Effect.fn(
-    "D1FileCatalog.renameFile",
-  )(function* (input) {
-    const current = yield* selectLiveById(input.fileSystemId, input.fileId)
-    if (current === null) return { _tag: "NotFound" }
-    if (current._tag === "Folder") return { _tag: "FolderNotSupported" }
-    const maybePath = yield* Effect.option(
-      replacePathLeaf(current.path, input.name),
-    )
-    if (Option.isNone(maybePath)) return { _tag: "InvalidPath" }
+  type MoveAttempt =
+    | { readonly _tag: "Decided"; readonly result: CatalogMoveResult }
+    | { readonly _tag: "Raced" }
 
-    const renamed = yield* runReturning(
-      "rename_file",
-      renameFileSql,
-      [
-        input.name,
-        maybePath.value,
-        input.actor.kind,
-        input.actor.id,
-        input.now,
-        input.fileSystemId,
-        input.fileId,
-        input.fileSystemId,
-        input.fileId,
-        maybePath.value,
-        input.name,
-      ],
-    )
-    if (
-      renamed?._tag === "PendingFile" ||
-      renamed?._tag === "ReadyFile"
-    ) {
-      return { _tag: "Renamed", node: renamed }
-    }
-    if (renamed !== null) return yield* Effect.fail(invalidStoredRow())
+  const moveOnce = (
+    input: CatalogMoveInput,
+  ): Effect.Effect<
+    MoveAttempt,
+    FileCatalogUnavailable | InvalidStoredFile
+  > =>
+    Effect.gen(function* () {
+      const decided = (result: CatalogMoveResult): MoveAttempt => ({
+        _tag: "Decided",
+        result,
+      })
+      const current = yield* selectLiveById(input.fileSystemId, input.fileId)
+      if (current === null) return decided({ _tag: "NotFound" })
+      if (
+        input.expectedUpdatedAt !== null &&
+        current.updatedAt !== input.expectedUpdatedAt
+      ) {
+        return decided({ _tag: "Stale", node: current })
+      }
+      if (
+        current.parentId === input.parentId &&
+        current.name === input.name
+      ) {
+        return decided({ _tag: "Unchanged", node: current })
+      }
+      if (input.parentId === input.fileId) return decided({ _tag: "Cycle" })
 
-    const afterRace = yield* selectLiveById(input.fileSystemId, input.fileId)
-    if (afterRace === null) return { _tag: "NotFound" }
-    if (afterRace._tag === "Folder") return { _tag: "FolderNotSupported" }
-    if (
-      yield* hasLiveSibling(
-        input.fileSystemId,
-        afterRace.parentId,
-        input.name,
-        input.fileId,
+      const parent = yield* resolveParent(input.fileSystemId, input.parentId)
+      if (parent._tag !== "Parent") return decided(parent)
+      if (
+        parent.path !== null &&
+        (parent.path === current.path ||
+          parent.path.startsWith(`${current.path}/`))
+      ) {
+        return decided({ _tag: "Cycle" })
+      }
+      const maybePath = yield* Effect.option(
+        childPath(parent.path, input.name),
       )
-    ) {
-      return { _tag: "NameConflict" }
-    }
-    return yield* Effect.fail(
-      unavailable(
-        "rename_file",
-        new Error("D1 did not classify the rejected file rename."),
-      ),
-    )
-  })
+      if (Option.isNone(maybePath)) return decided({ _tag: "InvalidPath" })
+
+      const result = yield* attempt("move_node", () =>
+        database
+          .prepare(moveSubtreeSql)
+          .bind(
+            input.fileSystemId,
+            input.fileId,
+            current.path,
+            current.updatedAt,
+            input.parentId,
+            parent.path,
+            input.name,
+            maybePath.value,
+            input.actor.kind,
+            input.actor.id,
+            input.now,
+          )
+          .run(),
+      )
+      const parsed = yield* Schema.decodeUnknownEffect(ChangedRowsSchema)(
+        result,
+      ).pipe(Effect.mapError(invalidStoredRow))
+      if (parsed.meta.changes > 0) {
+        const moved = yield* selectLiveById(input.fileSystemId, input.fileId)
+        if (moved === null) return decided({ _tag: "NotFound" })
+        return decided({ _tag: "Moved", node: moved })
+      }
+
+      const after = yield* selectLiveById(input.fileSystemId, input.fileId)
+      if (after === null) return decided({ _tag: "NotFound" })
+      if (
+        after.path !== current.path ||
+        after.updatedAt !== current.updatedAt
+      ) {
+        return input.expectedUpdatedAt === null
+          ? { _tag: "Raced" }
+          : decided({ _tag: "Stale", node: after })
+      }
+      const parentAfter = yield* resolveParent(
+        input.fileSystemId,
+        input.parentId,
+      )
+      if (parentAfter._tag !== "Parent") return decided(parentAfter)
+      if (parentAfter.path !== parent.path) return { _tag: "Raced" }
+      if (
+        yield* hasLiveSibling(
+          input.fileSystemId,
+          input.parentId,
+          input.name,
+          input.fileId,
+        )
+      ) {
+        return decided({ _tag: "NameConflict" })
+      }
+      if (
+        (yield* selectLiveByPath(input.fileSystemId, maybePath.value)) !== null
+      ) {
+        return decided({ _tag: "NameConflict" })
+      }
+      return decided({ _tag: "InvalidPath" })
+    })
+
+  const move: FileCatalogService["move"] = Effect.fn("D1FileCatalog.move")(
+    function* (input) {
+      const first = yield* moveOnce(input)
+      if (first._tag === "Decided") return first.result
+      const second = yield* moveOnce(input)
+      if (second._tag === "Decided") return second.result
+      return yield* Effect.fail(
+        unavailable(
+          "move_node",
+          new Error("D1 did not classify the rejected move twice."),
+        ),
+      )
+    },
+  )
 
   const softDelete: FileCatalogService["softDelete"] = Effect.fn(
     "D1FileCatalog.softDelete",
-  )(function* (input) {
-    const current = yield* selectLiveById(input.fileSystemId, input.fileId)
-    if (current === null) return { _tag: "NotFound" }
-    const descendantPrefix = `${current.path}/`
+  )(function* (input: CatalogSoftDeleteInput) {
     const result = yield* attempt("soft_delete", () =>
       database
         .prepare(softDeleteSubtreeSql)
         .bind(
+          input.fileSystemId,
+          input.fileId,
+          input.expectedUpdatedAt,
+          input.expectedUpdatedAt,
           input.now,
           input.actor.kind,
           input.actor.id,
@@ -1502,18 +1716,56 @@ const makeD1Adapters = (database: D1FilesDatabase): D1Adapters => {
           input.reclaimAfter,
           input.reclaimAfter,
           input.fileSystemId,
-          current.path,
-          descendantPrefix,
-          descendantPrefix,
+          input.fileId,
         )
         .run(),
     )
     const parsed = yield* Schema.decodeUnknownEffect(ChangedRowsSchema)(
       result,
     ).pipe(Effect.mapError(invalidStoredRow))
-    return parsed.meta.changes === 0
-      ? { _tag: "NotFound" }
-      : { _tag: "Deleted" }
+    if (parsed.meta.changes > 0) {
+      const deleted: CatalogSoftDeleteResult = { _tag: "Deleted" }
+      return deleted
+    }
+    const current = yield* selectLiveById(input.fileSystemId, input.fileId)
+    const outcome: CatalogSoftDeleteResult =
+      current === null
+        ? { _tag: "NotFound" }
+        : { _tag: "Stale", node: current }
+    return outcome
+  })
+
+  const decodeChange = (row: D1FileChangeRow) =>
+    Schema.decodeUnknownEffect(FileChangeSchema)({
+      sequence: row.sequence,
+      kind: row.kind,
+      fileId: row.fileId,
+      nodeKind: row.nodeKind,
+      path: row.path,
+      previousPath: row.previousPath,
+      actor: { kind: row.actorKind, id: row.actorId },
+      at: row.recordedAt,
+    }).pipe(Effect.mapError(invalidStoredRow))
+
+  const listChanges: FileCatalogService["listChanges"] = Effect.fn(
+    "D1FileCatalog.listChanges",
+  )(function* (fileSystemId, after, limit) {
+    const rows = yield* attempt("list_file_changes", () =>
+      drizzleDatabase
+        .select()
+        .from(d1FileChanges)
+        .where(
+          and(
+            eq(d1FileChanges.fileSystemId, fileSystemId),
+            after === null ? undefined : gt(d1FileChanges.sequence, after),
+          ),
+        )
+        .orderBy(asc(d1FileChanges.sequence))
+        .limit(limit + 1),
+    )
+    const changes = yield* Effect.forEach(rows.slice(0, limit), decodeChange)
+    const page: FileChangePage = { changes, more: rows.length > limit }
+    return page
   })
 
   const expirePendingBatch: FileReclamationCatalogService["expirePendingBatch"] =
@@ -1599,6 +1851,40 @@ const makeD1Adapters = (database: D1FilesDatabase): D1Adapters => {
       )
     })
 
+  const maintenanceDue: FileReclamationCatalogService["maintenanceDue"] =
+    Effect.fn("D1FileReclamationCatalog.maintenanceDue")(function* () {
+      const raw = yield* attempt("file_maintenance_due", () =>
+        database.prepare(maintenanceDueSql).raw(),
+      )
+      const rows = yield* Schema.decodeUnknownEffect(
+        MaintenanceDueRowsSchema,
+      )(raw).pipe(Effect.mapError(invalidStoredRow))
+      const [pendingExpiresAt, reclaimAfter, reclaimedDeletedAt, oldestChangeAt] =
+        rows[0] ?? [null, null, null, null]
+      return {
+        pendingExpiresAt,
+        reclaimAfter,
+        reclaimedDeletedAt,
+        oldestChangeAt,
+      }
+    })
+
+  const purgeChangesBatch: FileReclamationCatalogService["purgeChangesBatch"] =
+    Effect.fn("D1FileReclamationCatalog.purgeChangesBatch")(function* (
+      input,
+    ) {
+      const result = yield* attempt("purge_file_changes", () =>
+        database
+          .prepare(purgeChangesBatchSql)
+          .bind(input.recordedBefore, input.limit)
+          .run(),
+      )
+      const parsed = yield* Schema.decodeUnknownEffect(ChangedRowsSchema)(
+        result,
+      ).pipe(Effect.mapError(invalidStoredRow))
+      return parsed.meta.changes
+    })
+
   const purgeReclaimedBatch: FileReclamationCatalogService["purgeReclaimedBatch"] =
     Effect.fn("D1FileReclamationCatalog.purgeReclaimedBatch")(function* (
       input,
@@ -1622,8 +1908,9 @@ const makeD1Adapters = (database: D1FilesDatabase): D1Adapters => {
       createFolder,
       reserveUpload,
       confirmUpload,
-      renameFile,
+      move,
       softDelete,
+      listChanges,
     }),
     reclamation: FileReclamationCatalog.of({
       expirePendingBatch,
@@ -1631,6 +1918,8 @@ const makeD1Adapters = (database: D1FilesDatabase): D1Adapters => {
       completeReclamation,
       deferReclamation,
       purgeReclaimedBatch,
+      maintenanceDue,
+      purgeChangesBatch,
     }),
   }
 }

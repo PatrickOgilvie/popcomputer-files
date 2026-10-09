@@ -21,35 +21,36 @@ const hasInvalidCodePoint = (value: string): boolean => {
   return false
 }
 
-const identifier = <const Brand extends string>(brand: Brand) =>
-  Schema.String.check(
-    Schema.isNonEmpty(),
-    Schema.isMaxLength(200),
-    Schema.isPattern(identifierPattern),
-  ).pipe(Schema.brand(brand))
+const IdentifierSchema = Schema.String.check(
+  Schema.isNonEmpty(),
+  Schema.isMaxLength(200),
+  Schema.isPattern(identifierPattern),
+)
 
 /** Opaque identity of one file or folder. */
-export const FileIdSchema = identifier("@popcomputer/files/FileId")
+export const FileIdSchema = IdentifierSchema.pipe(
+  Schema.brand("@popcomputer/files/FileId"),
+)
 /** Opaque identity of one file or folder. */
 export type FileId = Schema.Schema.Type<typeof FileIdSchema>
 
 /** Stable identity of one isolated logical filesystem. */
-export const FileSystemIdSchema = identifier(
-  "@popcomputer/files/FileSystemId",
+export const FileSystemIdSchema = IdentifierSchema.pipe(
+  Schema.brand("@popcomputer/files/FileSystemId"),
 )
 /** Stable identity of one isolated logical filesystem. */
 export type FileSystemId = Schema.Schema.Type<typeof FileSystemIdSchema>
 
 /** Opaque identity of the actor performing one operation. */
-export const FileActorIdSchema = identifier(
-  "@popcomputer/files/FileActorId",
+export const FileActorIdSchema = IdentifierSchema.pipe(
+  Schema.brand("@popcomputer/files/FileActorId"),
 )
 /** Opaque identity of the actor performing one operation. */
 export type FileActorId = Schema.Schema.Type<typeof FileActorIdSchema>
 
 /** Application-defined actor category. */
-export const FileActorKindSchema = identifier(
-  "@popcomputer/files/FileActorKind",
+export const FileActorKindSchema = IdentifierSchema.pipe(
+  Schema.brand("@popcomputer/files/FileActorKind"),
 )
 /** Application-defined actor category. */
 export type FileActorKind = Schema.Schema.Type<typeof FileActorKindSchema>
@@ -121,9 +122,16 @@ export const PageCursorSchema = Schema.String.check(
 /** Opaque keyset cursor returned by a catalog. */
 export type PageCursor = Schema.Schema.Type<typeof PageCursorSchema>
 
+/** Unicode code points, the unit SQLite's `length()` counts, so limits agree in SQL and code. */
+const codePointLength = (value: string): number => {
+  let count = 0
+  for (const _ of value) count += 1
+  return count
+}
+
 const isValidSegment = (segment: string): boolean =>
   segment.length > 0 &&
-  segment.length <= 255 &&
+  codePointLength(segment) <= 255 &&
   segment !== "." &&
   !segment.startsWith("..") &&
   !segment.includes("/") &&
@@ -133,7 +141,7 @@ const isValidSegment = (segment: string): boolean =>
   !segment.endsWith(".") &&
   segment === segment.normalize("NFC")
 
-/** Canonical NFC-normalized single path segment. */
+/** Canonical NFC-normalized single path segment of at most 255 code points. */
 export const FileNameSchema = Schema.String.check(
   Schema.makeFilter(isValidSegment, {
     expected: "an NFC-normalized file name without traversal or separators",
@@ -145,7 +153,7 @@ export type FileName = Schema.Schema.Type<typeof FileNameSchema>
 const isValidRelativePath = (path: string): boolean => {
   if (
     path.length === 0 ||
-    path.length > 1024 ||
+    codePointLength(path) > 1024 ||
     path.startsWith("/") ||
     path !== path.normalize("NFC")
   ) {
@@ -155,7 +163,7 @@ const isValidRelativePath = (path: string): boolean => {
   return segments.length <= 32 && segments.every(isValidSegment)
 }
 
-/** Canonical relative path within one filesystem. */
+/** Canonical relative path of at most 1024 code points and 32 segments. */
 export const RelativePathSchema = Schema.String.check(
   Schema.makeFilter(isValidRelativePath, {
     expected: "an NFC-normalized relative path with at most 32 segments",
@@ -192,6 +200,27 @@ export const FileContentTypeSchema = Schema.String.check(
 export type FileContentType = Schema.Schema.Type<
   typeof FileContentTypeSchema
 >
+
+/** Lowercase hexadecimal SHA-256 digest of a file's bytes. */
+export const Sha256Schema = Schema.String.check(
+  Schema.isPattern(sha256Pattern),
+).pipe(Schema.brand("@popcomputer/files/Sha256"))
+/** Lowercase hexadecimal SHA-256 digest of a file's bytes. */
+export type Sha256 = Schema.Schema.Type<typeof Sha256Schema>
+
+/** Compute the SHA-256 of bytes held in memory with Web Crypto. */
+export const sha256Of = (
+  bytes: Uint8Array<ArrayBuffer>,
+): Effect.Effect<Sha256> =>
+  Effect.promise(() => crypto.subtle.digest("SHA-256", bytes)).pipe(
+    Effect.map((digest) =>
+      Sha256Schema.make(
+        Array.from(new Uint8Array(digest), (byte) =>
+          byte.toString(16).padStart(2, "0"),
+        ).join(""),
+      ),
+    ),
+  )
 
 /** Parse and NFC-normalize a file name from unknown boundary input. */
 export const parseFileName = (
@@ -319,4 +348,54 @@ export interface DownloadTicket {
   readonly file: ReadyFileNode
   readonly url: CapabilityUrl
   readonly expiresAt: TimestampMillis
+}
+
+/** What happened to one visible node. */
+export const FileChangeKindSchema = Schema.Literals([
+  "folder_created",
+  "file_ready",
+  "node_moved",
+  "node_deleted",
+])
+/** What happened to one visible node. */
+export type FileChangeKind = Schema.Schema.Type<typeof FileChangeKindSchema>
+
+/** Position of one change in a catalog's commit-ordered change log. */
+export const FileChangeSequenceSchema = Schema.Number.check(
+  Schema.isInt(),
+  Schema.isGreaterThanOrEqualTo(1),
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+).pipe(Schema.brand("@popcomputer/files/FileChangeSequence"))
+/** Position of one change in a catalog's commit-ordered change log. */
+export type FileChangeSequence = Schema.Schema.Type<
+  typeof FileChangeSequenceSchema
+>
+
+/**
+ * One committed change to a folder or ready file, recorded in the same
+ * transaction as the change itself. Pending uploads are never reported: a file
+ * first appears as `file_ready` at its path at that moment. Moving or deleting
+ * a folder reports every visible node in its subtree; those changes share one
+ * instant, and their order among themselves is the store's row order.
+ */
+export const FileChangeSchema = Schema.Struct({
+  sequence: FileChangeSequenceSchema,
+  kind: FileChangeKindSchema,
+  fileId: FileIdSchema,
+  nodeKind: Schema.Literals(["folder", "file"]),
+  path: RelativePathSchema,
+  /** The path before a `node_moved` change; null for every other kind. */
+  previousPath: Schema.NullOr(RelativePathSchema),
+  actor: FileActorSchema,
+  at: TimestampMillisSchema,
+})
+/** One committed change to a folder or ready file. */
+export interface FileChange
+  extends Schema.Schema.Type<typeof FileChangeSchema> {}
+
+/** Changes after a known position, oldest first. */
+export interface FileChangePage {
+  readonly changes: ReadonlyArray<FileChange>
+  /** Whether more changes follow the last one returned. */
+  readonly more: boolean
 }

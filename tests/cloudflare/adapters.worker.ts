@@ -15,6 +15,7 @@ import {
   MaintenanceBatchSizeSchema,
   PageSizeSchema,
   DurationMillisSchema,
+  Sha256Schema,
   TimestampMillisSchema,
   rootListTarget,
   type FileSystemId,
@@ -60,6 +61,8 @@ const makeR2UploadFixture = async (maximumBytes = 5) => {
       expiresAt: TimestampMillisSchema.make(
         Date.now() + objects.uploadCapabilityTtlMillis,
       ),
+      sha256: null,
+      contentType: null,
     }),
   )
   const handler = makeCloudflareFileDataPlaneHandler({
@@ -115,6 +118,7 @@ describe("Cloudflare production adapters in workerd", () => {
         locator: FileObjectLocatorSchema.make(`workerd:${suffix}`),
         maximumBytes: ByteCountSchema.make(5),
         pendingExpiresAt: TimestampMillisSchema.make(Date.now() + 60_000),
+        expectedSha256: null,
       }),
     )
     if (upload._tag !== "Created") {
@@ -173,6 +177,7 @@ describe("Cloudflare production adapters in workerd", () => {
         locator: FileObjectLocatorSchema.make(`race:${suffix}:first`),
         maximumBytes,
         pendingExpiresAt,
+        expectedSha256: null,
       }),
     )
     const second = await Effect.runPromise(
@@ -187,6 +192,7 @@ describe("Cloudflare production adapters in workerd", () => {
         locator: FileObjectLocatorSchema.make(`race:${suffix}:second`),
         maximumBytes,
         pendingExpiresAt,
+        expectedSha256: null,
       }),
     )
     if (first._tag !== "Created" || second._tag !== "Created") {
@@ -243,6 +249,7 @@ describe("Cloudflare production adapters in workerd", () => {
           locator: FileObjectLocatorSchema.make(crypto.randomUUID()),
           maximumBytes: ByteCountSchema.make(maximumBytes),
           pendingExpiresAt: TimestampMillisSchema.make(now + 60_000),
+          expectedSha256: null,
         }),
       )
     }
@@ -476,6 +483,7 @@ describe("Cloudflare production adapters in workerd", () => {
       locator,
       maximumBytes: ByteCountSchema.make(5),
       pendingExpiresAt: TimestampMillisSchema.make(now - 1),
+      expectedSha256: null,
     }
     const catalog = makeD1FileCatalog(env.FILES_DB)
 
@@ -500,6 +508,7 @@ describe("Cloudflare production adapters in workerd", () => {
           concurrency: 2,
           retryDelayMillis: DurationMillisSchema.make(1_000),
           metadataRetentionMillis: DurationMillisSchema.make(0),
+          changeRetentionMillis: DurationMillisSchema.make(0),
         }),
       ).pipe(Layer.provide(infrastructure))
       const result = await Effect.runPromise(
@@ -532,6 +541,260 @@ describe("Cloudflare production adapters in workerd", () => {
       )
         .bind(fileSystemId)
         .run()
+    }
+  })
+})
+
+describe("Cloudflare adapters: digests, prefixes, host bytes, moves", () => {
+  const actor = FileActorSchema.make({
+    kind: FileActorKindSchema.make("test"),
+    id: FileActorIdSchema.make("workerd-test"),
+  })
+  const sha256Hex = async (value: string) =>
+    Array.from(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
+      ),
+      (byte) => byte.toString(16).padStart(2, "0"),
+    ).join("")
+
+  const prefixedObjects = (suffix: string) =>
+    makeCloudflareFileObjects({
+      bucket: env.FILES_BUCKET,
+      capabilityOrigin: new URL("https://files.example.com"),
+      signingSecret,
+      capabilityPolicy,
+      keyPrefix: `tenants/${suffix}/files/`,
+      capabilityPath: "/files-data/o/",
+    })
+
+  test("places objects under the host prefix and serves the host path", async () => {
+    const suffix = crypto.randomUUID()
+    const objects = prefixedObjects(suffix)
+    const locator = objects.locationFor(
+      FileSystemIdSchema.make(`prefix:${suffix}`),
+      FileIdSchema.make(crypto.randomUUID()),
+    )
+    expect(locator.startsWith(`tenants/${suffix}/files/`)).toBe(true)
+    const upload = await Effect.runPromise(
+      objects.issueUpload({
+        locator,
+        maximumBytes: ByteCountSchema.make(5),
+        expiresAt: TimestampMillisSchema.make(
+          Date.now() + objects.uploadCapabilityTtlMillis,
+        ),
+        sha256: null,
+        contentType: FileContentTypeSchema.make("text/csv"),
+      }),
+    )
+    const url = new URL(upload.url)
+    expect(url.pathname.startsWith("/files-data/o/")).toBe(true)
+
+    const handler = makeCloudflareFileDataPlaneHandler({
+      bucket: env.FILES_BUCKET,
+      signingSecret,
+      capabilityPolicy,
+      capabilityPath: "/files-data/o/",
+    })
+    const wrongPath = await handler(
+      new Request(`https://files.example.com/o/${url.pathname.slice(14)}`, {
+        method: "PUT",
+        body: "a,b",
+        headers: { "Content-Length": "3" },
+      }),
+    )
+    expect(wrongPath.status).toBe(404)
+    const stored = await handler(
+      new Request(upload.url, {
+        method: "PUT",
+        body: "a,b",
+        headers: { "Content-Length": "3", "Content-Type": "text/html" },
+      }),
+    )
+    expect(stored.status).toBe(204)
+    const head = await env.FILES_BUCKET.head(locator)
+    expect(head?.httpMetadata?.contentType).toBe("text/csv")
+    await env.FILES_BUCKET.delete(locator)
+  })
+
+  test("lets R2 enforce a declared SHA-256 and reports it on stat", async () => {
+    const suffix = crypto.randomUUID()
+    const objects = prefixedObjects(suffix)
+    const handler = makeCloudflareFileDataPlaneHandler({
+      bucket: env.FILES_BUCKET,
+      signingSecret,
+      capabilityPolicy,
+      capabilityPath: "/files-data/o/",
+    })
+    const digest = Sha256Schema.make(await sha256Hex("hello"))
+    const issue = (locator: ReturnType<typeof objects.locationFor>) =>
+      Effect.runPromise(
+        objects.issueUpload({
+          locator,
+          maximumBytes: ByteCountSchema.make(5),
+          expiresAt: TimestampMillisSchema.make(
+            Date.now() + objects.uploadCapabilityTtlMillis,
+          ),
+          sha256: digest,
+          contentType: null,
+        }),
+      )
+    const fileSystemId = FileSystemIdSchema.make(`digest:${suffix}`)
+
+    const rejectedLocator = objects.locationFor(
+      fileSystemId,
+      FileIdSchema.make(crypto.randomUUID()),
+    )
+    const rejected = await handler(
+      uploadRequest((await issue(rejectedLocator)).url, "olleh", 5),
+    )
+    expect(rejected.status).toBe(400)
+    expect(await env.FILES_BUCKET.head(rejectedLocator)).toBeNull()
+
+    const acceptedLocator = objects.locationFor(
+      fileSystemId,
+      FileIdSchema.make(crypto.randomUUID()),
+    )
+    const accepted = await handler(
+      uploadRequest((await issue(acceptedLocator)).url, "hello", 5),
+    )
+    expect(accepted.status).toBe(204)
+    const metadata = await Effect.runPromise(objects.stat(acceptedLocator))
+    expect(metadata?.digest).toEqual({ _tag: "Sha256", value: digest })
+    await env.FILES_BUCKET.delete(acceptedLocator)
+  })
+
+  test("stores and streams bytes the host already holds", async () => {
+    const suffix = crypto.randomUUID()
+    const objects = prefixedObjects(suffix)
+    const locator = objects.locationFor(
+      FileSystemIdSchema.make(`host:${suffix}`),
+      FileIdSchema.make(crypto.randomUUID()),
+    )
+    const body = new TextEncoder().encode("host bytes")
+    const sha256 = Sha256Schema.make(await sha256Hex("host bytes"))
+    await Effect.runPromise(
+      objects.put({
+        locator,
+        body,
+        contentType: FileContentTypeSchema.make("text/plain"),
+        sha256,
+      }),
+    )
+    await Effect.runPromise(
+      objects.put({
+        locator,
+        body: new TextEncoder().encode("other"),
+        contentType: null,
+        sha256: Sha256Schema.make(await sha256Hex("other")),
+      }),
+    )
+    const stream = await Effect.runPromise(objects.get(locator))
+    expect(stream === null ? null : await new Response(stream).text()).toBe(
+      "host bytes",
+    )
+    const metadata = await Effect.runPromise(objects.stat(locator))
+    expect(metadata?.digest).toEqual({ _tag: "Sha256", value: sha256 })
+    expect(metadata?.contentType).toBe("text/plain")
+    await env.FILES_BUCKET.delete(locator)
+  })
+
+  test("moves subtrees and writes the change log on real D1", async () => {
+    const catalog = makeD1FileCatalog(env.FILES_DB)
+    const suffix = crypto.randomUUID()
+    const fileSystemId = FileSystemIdSchema.make(`moves:${suffix}`)
+    const now = Date.now()
+    const create = async (id: string, parentId: string | null, at: number) => {
+      const result = await Effect.runPromise(
+        catalog.createFolder({
+          fileSystemId,
+          actor,
+          now: TimestampMillisSchema.make(at),
+          id: FileIdSchema.make(`${suffix}-${id}`),
+          parentId:
+            parentId === null ? null : FileIdSchema.make(`${suffix}-${parentId}`),
+          name: FileNameSchema.make(id),
+          idempotencyKey: IdempotencyKeySchema.make(`${suffix}:${id}`),
+        }),
+      )
+      expect(result._tag).toBe("Created")
+    }
+    try {
+      await create("a", null, now)
+      await create("b", "a", now + 1)
+      await create("c", null, now + 2)
+      const moved = await Effect.runPromise(
+        catalog.move({
+          fileSystemId,
+          actor,
+          now: TimestampMillisSchema.make(now + 10),
+          fileId: FileIdSchema.make(`${suffix}-a`),
+          parentId: FileIdSchema.make(`${suffix}-c`),
+          name: FileNameSchema.make("a2"),
+          expectedUpdatedAt: null,
+        }),
+      )
+      expect(moved._tag).toBe("Moved")
+      const child = await Effect.runPromise(
+        catalog.get(fileSystemId, FileIdSchema.make(`${suffix}-b`)),
+      )
+      expect(child?.path).toBe("c/a2/b")
+
+      const deleted = await Effect.runPromise(
+        catalog.softDelete({
+          fileSystemId,
+          actor,
+          now: TimestampMillisSchema.make(now + 20),
+          fileId: FileIdSchema.make(`${suffix}-c`),
+          reclaimAfter: TimestampMillisSchema.make(now + 30),
+          expectedUpdatedAt: null,
+        }),
+      )
+      expect(deleted._tag).toBe("Deleted")
+      const changes = await Effect.runPromise(
+        catalog.listChanges(fileSystemId, null, PageSizeSchema.make(100)),
+      )
+      const described = changes.changes.map(
+        (change) => `${change.kind} ${change.path}`,
+      )
+      // One statement's rows are logged in the engine's row order.
+      expect(described.slice(0, 3)).toEqual([
+        "folder_created a",
+        "folder_created a/b",
+        "folder_created c",
+      ])
+      expect(described.slice(3, 5).sort()).toEqual([
+        "node_moved c/a2",
+        "node_moved c/a2/b",
+      ])
+      expect(described.slice(5).sort()).toEqual([
+        "node_deleted c",
+        "node_deleted c/a2",
+        "node_deleted c/a2/b",
+      ])
+    } finally {
+      const nodes = await env.FILES_DB.prepare(
+        "SELECT id FROM popcomputer_files WHERE file_system_id = ? ORDER BY length(path) DESC",
+      )
+        .bind(fileSystemId)
+        .all<{ readonly id: string }>()
+      for (const node of nodes.results) {
+        await env.FILES_DB.prepare(
+          "DELETE FROM popcomputer_files WHERE file_system_id = ? AND id = ?",
+        )
+          .bind(fileSystemId, node.id)
+          .run()
+      }
+      for (const table of [
+        "popcomputer_file_changes",
+        "popcomputer_file_folder_requests",
+      ]) {
+        await env.FILES_DB.prepare(
+          `DELETE FROM ${table} WHERE file_system_id = ?`,
+        )
+          .bind(fileSystemId)
+          .run()
+      }
     }
   })
 })

@@ -34,6 +34,8 @@ export const FileReclaimerPolicySchema = Schema.Struct({
   concurrency: MaintenanceConcurrencySchema,
   retryDelayMillis: ReclamationRetryDelayMillisSchema,
   metadataRetentionMillis: DurationMillisSchema,
+  /** How long change-log entries are kept for consumers that fall behind. */
+  changeRetentionMillis: DurationMillisSchema,
 })
 
 /** Validated policy for one bounded reclamation worker. */
@@ -68,6 +70,19 @@ export interface FileReclaimerService {
   >
   readonly purgeMetadataBatch: () => Effect.Effect<
     number,
+    FileCatalogUnavailable | InvalidStoredFile
+  >
+  readonly purgeChangesBatch: () => Effect.Effect<
+    number,
+    FileCatalogUnavailable | InvalidStoredFile
+  >
+  /**
+   * The earliest instant any batch could make progress, so a host can set one
+   * alarm instead of polling. Null when nothing is waiting. Work that failed
+   * and was deferred is included at its retry time.
+   */
+  readonly nextWorkAt: () => Effect.Effect<
+    TimestampMillis | null,
     FileCatalogUnavailable | InvalidStoredFile
   >
 }
@@ -170,7 +185,39 @@ const makeService = Effect.gen(function* () {
     })
   })
 
-  return FileReclaimer.of({ runBatch, purgeMetadataBatch })
+  const purgeChangesBatch = Effect.fn("FileReclaimer.purgeChangesBatch")(
+    function* () {
+      const now = yield* nowMillis
+      return yield* catalog.purgeChangesBatch({
+        recordedBefore: subtractDuration(now, policy.changeRetentionMillis),
+        limit: policy.batchSize,
+      })
+    },
+  )
+
+  const nextWorkAt = Effect.fn("FileReclaimer.nextWorkAt")(function* () {
+    const due = yield* catalog.maintenanceDue()
+    const candidates = [
+      due.pendingExpiresAt,
+      due.reclaimAfter,
+      due.reclaimedDeletedAt === null
+        ? null
+        : addDuration(due.reclaimedDeletedAt, policy.metadataRetentionMillis),
+      due.oldestChangeAt === null
+        ? null
+        : addDuration(due.oldestChangeAt, policy.changeRetentionMillis),
+    ].filter((at): at is TimestampMillis => at !== null)
+    return candidates.length === 0
+      ? null
+      : TimestampMillisSchema.make(Math.min(...candidates))
+  })
+
+  return FileReclaimer.of({
+    runBatch,
+    purgeMetadataBatch,
+    purgeChangesBatch,
+    nextWorkAt,
+  })
 })
 
 /** Internal Effect service tag for validated reclaimer policy. */
